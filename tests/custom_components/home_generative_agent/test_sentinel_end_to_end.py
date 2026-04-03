@@ -1,4 +1,3 @@
-# ruff: noqa: S101
 """End-to-end sentinel test with synthetic snapshot."""
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.home_generative_agent.const import (
+    ACTION_POLICY_BLOCKED,
     CONF_SENTINEL_AUTO_EXEC_CANARY_MODE,
     CONF_SENTINEL_AUTO_EXECUTE_ALLOWED_SERVICES,
     CONF_SENTINEL_AUTO_EXECUTE_DEFAULT_MIN_CONFIDENCE,
@@ -20,7 +20,6 @@ from custom_components.home_generative_agent.const import (
 )
 from custom_components.home_generative_agent.sentinel.engine import SentinelEngine
 from custom_components.home_generative_agent.sentinel.execution import (
-    ACTION_POLICY_BLOCKED,
     ActionPolicyResult,
 )
 from custom_components.home_generative_agent.sentinel.models import AnomalyFinding
