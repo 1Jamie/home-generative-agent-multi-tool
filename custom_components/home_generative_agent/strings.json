@@ -135,6 +135,105 @@
         "unknown": "Unexpected error."
       }
     },
+    "tool_manager": {
+      "entry_type": "service",
+      "abort": {
+        "reconfigure_successful": "RAG tool configuration updated."
+      },
+      "initiate_flow": {
+        "reconfigure": "Reconfigure Tools",
+        "user": "Configure Tools"
+      },
+      "error": {
+        "instruction_name_required": "Enter a name for the new instruction."
+      },
+      "step": {
+        "user": {
+          "title": "{tool_manager_title}",
+          "description": "Choose what to configure, or save and finish.",
+          "menu_options": {
+            "global_settings": "Edit global settings",
+            "manage_providers": "Manage providers",
+            "manage_tools": "Manage tools",
+            "manage_instructions": "Manage instructions",
+            "finish": "Save and finish"
+          }
+        },
+        "global_settings": {
+          "title": "Global RAG settings",
+          "description": "Retrieval limits and relevance thresholds for tools and instructions.",
+          "data": {
+            "tool_retrieval_limit": "Top N tool retrieval limit",
+            "tool_relevance_threshold": "Tool relevance threshold (0.0 - 1.0)",
+            "instruction_retrieval_limit": "Top N instruction retrieval limit",
+            "instruction_relevance_threshold": "Instruction relevance threshold (0.0 - 1.0)",
+            "instruction_rag_intent_weight": "Instruction retrieval bias (intent vs. content)"
+          },
+          "data_description": {
+            "instruction_rag_intent_weight": "Lower values favor the text inside the instruction; higher values favor the instruction's name and tags (intent channel)."
+          }
+        },
+        "manage_providers": {
+          "title": "Manage providers",
+          "description": "Select a tool provider to configure tags and tier-2 prompts.",
+          "data": {
+            "selected_provider": "Provider"
+          }
+        },
+        "manage_tools": {
+          "title": "Manage tools",
+          "description": "Select a tool to configure tags and tier-3 prompts.",
+          "data": {
+            "selected_tool": "Tool"
+          }
+        },
+        "manage_instructions": {
+          "title": "Manage instructions",
+          "description": "Select an instruction to edit or add a new prompt and tags.",
+          "data": {
+            "selected_instruction": "Instruction"
+          }
+        },
+        "provider_editor": {
+          "title": "Provider: {provider_name}",
+          "description": "Enable/disable or inject instructions for all tools in this provider.",
+          "data": {
+            "enabled": "Enabled",
+            "prompt": "{provider_injection_label}",
+            "tags": "Custom Semantic Tags"
+          },
+          "data_description": {
+            "tags": "{semantic_tags_hint}"
+          }
+        },
+        "tool_editor": {
+          "title": "Tool: {tool_name}",
+          "description": "Enable/disable, add tags, or inject a specific tier-3 prompt for this tool.",
+          "data": {
+            "enabled": "Enabled",
+            "prompt": "{tool_injection_label}",
+            "tags": "Custom Semantic Tags"
+          },
+          "data_description": {
+            "tags": "{semantic_tags_hint}"
+          }
+        },
+        "instruction_editor": {
+          "title": "Instruction: {instruction_name}",
+          "description": "Enable/disable, add tags, or edit the tier-1.5 instruction text.",
+          "data": {
+            "instruction_name": "Instruction name",
+            "enabled": "Enabled",
+            "prompt": "{instruction_injection_label}",
+            "tags": "Custom Semantic Tags",
+            "delete_entry": "Delete this instruction"
+          },
+          "data_description": {
+            "tags": "{semantic_tags_hint}"
+          }
+        }
+      }
+    },
     "sentinel": {
       "entry_type": "service",
       "abort": {

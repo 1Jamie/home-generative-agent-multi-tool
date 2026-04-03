@@ -77,6 +77,7 @@ from custom_components.home_generative_agent.flows.stt_provider_subentry_flow im
     SttProviderSubentryFlow,
 )
 from custom_components.home_generative_agent.flows.tool_manager_subentry_flow import (
+    ADD_NEW_INSTRUCTION_VALUE,
     ToolManagerSubentryFlow,
 )
 
@@ -921,6 +922,12 @@ async def test_tool_manager_subentry_flow_creates_subentry(
         "data_schema": kwargs["data_schema"],
         "description_placeholders": kwargs.get("description_placeholders"),
     }
+    flow.async_show_menu = lambda **kwargs: {  # type: ignore[assignment]
+        "type": "menu",
+        "step_id": kwargs.get("step_id"),
+        "menu_options": kwargs.get("menu_options"),
+        "description_placeholders": kwargs.get("description_placeholders"),
+    }
     flow.async_create_entry = lambda **kwargs: {  # type: ignore[assignment]
         "type": "create_entry",
         "title": kwargs.get("title"),
@@ -931,18 +938,12 @@ async def test_tool_manager_subentry_flow_creates_subentry(
     _patch_entry(flow, entry)
 
     first = await flow.async_step_user()
-    assert first.get("type") == "form"
+    assert first.get("type") == "menu"
 
     # Go to provider editor
-    second = await flow.async_step_user(
-        {
-            "tool_retrieval_limit": 5,
-            "tool_relevance_threshold": 0.5,
-            "instruction_retrieval_limit": 5,
-            "instruction_relevance_threshold": 0.5,
-            "instruction_rag_intent_weight": 0.65,
-            "next_action": "edit_provider_langchain_internal",
-        }
+    await flow.async_step_manage_providers(None)
+    second = await flow.async_step_manage_providers(
+        {"selected_provider": "langchain_internal"}
     )
     assert second.get("type") == "form"
     ph2 = second.get("description_placeholders") or {}
@@ -952,19 +953,11 @@ async def test_tool_manager_subentry_flow_creates_subentry(
     third = await flow.async_step_provider_editor(
         {"enabled": False, "prompt": "Test Provider Context", "tags": "semantic, tags"}
     )
-    assert third.get("type") == "form"  # returns to user step
+    assert third.get("type") == "menu"
 
     # Go to tool editor
-    fourth = await flow.async_step_user(
-        {
-            "tool_retrieval_limit": 5,
-            "tool_relevance_threshold": 0.5,
-            "instruction_retrieval_limit": 5,
-            "instruction_relevance_threshold": 0.5,
-            "instruction_rag_intent_weight": 0.65,
-            "next_action": "edit_tool_add_automation",
-        }
-    )
+    await flow.async_step_manage_tools(None)
+    fourth = await flow.async_step_manage_tools({"selected_tool": "add_automation"})
     assert fourth.get("type") == "form"
     ph4 = fourth.get("description_placeholders") or {}
     assert ph4["tool_name"] == "add_automation"
@@ -973,19 +966,20 @@ async def test_tool_manager_subentry_flow_creates_subentry(
     fifth = await flow.async_step_tool_editor(
         {"enabled": True, "prompt": "Test Tool Instructions", "tags": "automation tags"}
     )
-    assert fifth.get("type") == "form"  # returns to user step
+    assert fifth.get("type") == "menu"
 
-    # Save and exit
-    result = await flow.async_step_user(
+    # Global RAG values then finish
+    await flow.async_step_global_settings(None)
+    await flow.async_step_global_settings(
         {
             "tool_retrieval_limit": 10,
             "tool_relevance_threshold": 0.75,
             "instruction_retrieval_limit": 10,
             "instruction_relevance_threshold": 0.75,
             "instruction_rag_intent_weight": 0.65,
-            "next_action": "save",
         }
     )
+    result = await flow.async_step_finish()
     assert result.get("type") == "create_entry"
     data = result.get("data")
     assert data is not None
@@ -1010,6 +1004,12 @@ async def test_tool_manager_subentry_flow_instructions(
         "data_schema": kwargs["data_schema"],
         "description_placeholders": kwargs.get("description_placeholders"),
     }
+    flow.async_show_menu = lambda **kwargs: {  # type: ignore[assignment]
+        "type": "menu",
+        "step_id": kwargs.get("step_id"),
+        "menu_options": kwargs.get("menu_options"),
+        "description_placeholders": kwargs.get("description_placeholders"),
+    }
     flow.async_create_entry = lambda **kwargs: {  # type: ignore[assignment]
         "type": "create_entry",
         "title": kwargs.get("title"),
@@ -1021,37 +1021,24 @@ async def test_tool_manager_subentry_flow_instructions(
 
     await flow.async_step_user()
 
-    # Start adding instruction
-    step1 = await flow.async_step_user(
-        {
-            "tool_retrieval_limit": 5,
-            "tool_relevance_threshold": 0.5,
-            "instruction_retrieval_limit": 5,
-            "instruction_relevance_threshold": 0.5,
-            "instruction_rag_intent_weight": 0.65,
-            "next_action": "add_instruction",
-        }
+    # Start adding instruction (+ Add New)
+    await flow.async_step_manage_instructions(None)
+    step1 = await flow.async_step_manage_instructions(
+        {"selected_instruction": ADD_NEW_INSTRUCTION_VALUE}
     )
     assert step1.get("type") == "form"
-    assert step1.get("step_id") == "instruction_name"
+    assert step1.get("step_id") == "instruction_editor"
 
-    # Set name
-    step2 = await flow.async_step_instruction_name({"name": "Test Instruction"})
-    assert step2.get("type") == "form"
-    assert step2.get("step_id") == "instruction_editor"
-    phs2 = step2.get("description_placeholders") or {}
-    assert phs2["instruction_name"] == "Test Instruction"
-
-    # Save content
+    # Save content (name field required for new)
     step3 = await flow.async_step_instruction_editor(
         {
+            "instruction_name": "Test Instruction",
             "enabled": True,
             "prompt": "Test Instruction Prompt",
             "tags": "test, tags",
-            "delete_entry": False,
         }
     )
-    assert step3.get("type") == "form"  # Returns to user step
+    assert step3.get("type") == "menu"
 
     # Verify it exists in payload
     assert "Test Instruction" in flow._payload["instructions"]
@@ -1060,21 +1047,15 @@ async def test_tool_manager_subentry_flow_instructions(
         == "Test Instruction Prompt"
     )
 
-    # Edit it
-    step4 = await flow.async_step_user(
-        {
-            "tool_retrieval_limit": 5,
-            "tool_relevance_threshold": 0.5,
-            "instruction_retrieval_limit": 5,
-            "instruction_relevance_threshold": 0.5,
-            "instruction_rag_intent_weight": 0.65,
-            "next_action": "edit_instruction_Test Instruction",
-        }
+    # Open existing instruction for delete
+    await flow.async_step_manage_instructions(None)
+    step4 = await flow.async_step_manage_instructions(
+        {"selected_instruction": "Test Instruction"}
     )
     assert step4.get("type") == "form"
     assert step4.get("step_id") == "instruction_editor"
 
     # Delete it
     step5 = await flow.async_step_instruction_editor({"delete_entry": True})
-    assert step5.get("type") == "form"
+    assert step5.get("type") == "menu"
     assert "Test Instruction" not in flow._payload["instructions"]
