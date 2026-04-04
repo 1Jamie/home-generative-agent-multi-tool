@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_API_KEY,
     CONF_HOST,
@@ -29,6 +30,7 @@ from custom_components.home_generative_agent.const import (
     CONF_INSTRUCTION_RAG_INTENT_WEIGHT,
     CONF_INSTRUCTION_RELEVANCE_THRESHOLD,
     CONF_INSTRUCTION_RETRIEVAL_LIMIT,
+    CONF_INSTRUCTIONS_CONFIG,
     CONF_NOTIFY_SERVICE,
     CONF_OLLAMA_CHAT_MODEL,
     CONF_OLLAMA_CHAT_URL,
@@ -55,8 +57,10 @@ from custom_components.home_generative_agent.const import (
     SUBENTRY_TYPE_SENTINEL,
     SUBENTRY_TYPE_STT_PROVIDER,
     SUBENTRY_TYPE_TOOL_MANAGER,
+    tool_manager_subentry_unique_id,
 )
 from custom_components.home_generative_agent.core.subentry_resolver import (
+    get_tool_manager_subentry,
     legacy_model_provider_configs,
     resolve_runtime_options,
 )
@@ -84,7 +88,6 @@ from custom_components.home_generative_agent.flows.tool_manager_subentry_flow im
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
 
@@ -104,12 +107,15 @@ class DummySubentry:
         subentry_type: str,
         title: str,
         data: dict[str, Any],
+        *,
+        unique_id: str | None = None,
     ) -> None:
         """Initialize dummy subentry."""
         self.subentry_id = subentry_id
         self.subentry_type = subentry_type
         self.title = title
         self.data: dict[str, Any] = data
+        self.unique_id = unique_id
 
 
 class DummyEntry:
@@ -1059,3 +1065,74 @@ async def test_tool_manager_subentry_flow_instructions(
     step5 = await flow.async_step_instruction_editor({"delete_entry": True})
     assert step5.get("type") == "menu"
     assert "Test Instruction" not in flow._payload["instructions"]
+
+
+def test_get_tool_manager_subentry_prefers_canonical_unique_id() -> None:
+    """Runtime must use the auto-created TM subentry, not the first dict key."""
+    entry = DummyEntry()
+    canonical_uid = tool_manager_subentry_unique_id(entry.entry_id)
+    dup_first = DummySubentry(
+        "dup",
+        SUBENTRY_TYPE_TOOL_MANAGER,
+        "Dup",
+        {CONF_INSTRUCTIONS_CONFIG: {"stale": {"prompt": "bad"}}},
+        unique_id="duplicate_other",
+    )
+    canonical = DummySubentry(
+        "tm1",
+        SUBENTRY_TYPE_TOOL_MANAGER,
+        "Tool Manager",
+        {CONF_INSTRUCTIONS_CONFIG: {"weather": {"prompt": "ok"}}},
+        unique_id=canonical_uid,
+    )
+    entry.subentries["dup"] = dup_first
+    entry.subentries["tm1"] = canonical
+    assert get_tool_manager_subentry(cast(ConfigEntry, entry)) is canonical
+
+
+@pytest.mark.asyncio
+async def test_tool_manager_flow_finish_updates_existing_subentry_without_subentry_id(
+    hass: HomeAssistant,
+) -> None:
+    """USER flow without context subentry_id must load and update the singleton TM."""
+    entry = DummyEntry()
+    canonical_uid = tool_manager_subentry_unique_id(entry.entry_id)
+    stored = {
+        CONF_INSTRUCTIONS_CONFIG: {
+            "weather": {"enabled": True, "prompt": "stored prompt", "tags": "w"}
+        },
+        "tool_providers": {},
+        "tools": {},
+    }
+    tm = DummySubentry(
+        "tm1",
+        SUBENTRY_TYPE_TOOL_MANAGER,
+        "Tool Manager",
+        stored,
+        unique_id=canonical_uid,
+    )
+    entry.subentries["tm1"] = tm
+
+    flow = ToolManagerSubentryFlow()
+    flow.hass = hass
+    flow._schedule_reload = lambda: None  # type: ignore[assignment]
+    flow._trigger_reindex = lambda: None  # type: ignore[assignment]
+    _patch_entry(flow, entry)
+
+    update_calls: list[dict[str, Any]] = []
+
+    def fake_update_abort(*_a: Any, **kw: Any) -> dict[str, Any]:
+        update_calls.append(kw)
+        return {"type": "abort", "reason": "reconfigure_successful"}
+
+    def fake_create_entry(**_kw: Any) -> dict[str, Any]:
+        msg = "async_create_entry should not run when singleton subentry exists"
+        raise AssertionError(msg)
+
+    flow.async_update_and_abort = fake_update_abort  # type: ignore[method-assign]
+    flow.async_create_entry = fake_create_entry  # type: ignore[assignment]
+
+    await flow.async_step_finish()
+    assert len(update_calls) == 1
+    data = update_calls[0]["data"]
+    assert data[CONF_INSTRUCTIONS_CONFIG]["weather"]["prompt"] == "stored prompt"

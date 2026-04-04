@@ -49,12 +49,17 @@ from ..const import (  # noqa: TID252
     CONF_CRITICAL_ACTION_PIN_HASH,
     CONF_CRITICAL_ACTION_PIN_SALT,
     CONF_NOTIFY_SERVICE,
+    CONF_TOOL_RELEVANCE_THRESHOLD,
     CONF_VLM_CAPABILITY,
     CRITICAL_PIN_MAX_LEN,
     CRITICAL_PIN_MIN_LEN,
     EMBEDDING_MODEL_PROMPT_TEMPLATE,
     HISTORY_TOOL_CONTEXT_LIMIT,
     HISTORY_TOOL_PURGE_KEEP_DAYS,
+    MOCHI_SEEK_DROP_ENTITY_ATTRIBUTES,
+    MOCHI_SEEK_MAX_ENTITIES,
+    MOCHI_SEEK_PER_QUERY_LIMIT,
+    RECOMMENDED_TOOL_RELEVANCE_THRESHOLD,
     RECOMMENDED_VLM_CAPABILITY,
     VLM_ADVANCED_OBJECTS_TASK_TEMPLATE,
     VLM_CAPABILITY_ADVANCED,
@@ -68,7 +73,9 @@ from ..const import (  # noqa: TID252
     VLM_USER_PROMPT,
 )
 from ..core.conversation_helpers import _resolve_entity_id  # noqa: TID252
+from ..core.entity_index import ENTITY_INDEX_NAMESPACE  # noqa: TID252
 from ..core.utils import extract_final, verify_pin  # noqa: TID252
+from ..snapshot.builder import _build_area_lookup  # noqa: TID252
 from .camera_activity import get_camera_last_events_from_states
 from .helpers import (
     ConfigurableData,
@@ -110,6 +117,126 @@ async def resolve_entity_ids(  # noqa: D417
         if isinstance(entity_id, str):
             resolved[entity_id] = _resolve_entity_id(entity_id, hass)
     return resolved
+
+
+def _mochi_seek_condense_entity(
+    hass: HomeAssistant,
+    entity_id: str,
+    *,
+    area_lookup: dict[str, str | None],
+) -> dict[str, Any] | None:
+    """Return a small state dict; omit UI-centric attributes."""
+    state_obj = hass.states.get(entity_id)
+    if not state_obj:
+        return None
+    attrs = {
+        k: v
+        for k, v in state_obj.attributes.items()
+        if k not in MOCHI_SEEK_DROP_ENTITY_ATTRIBUTES
+    }
+    return {
+        "entity_id": entity_id,
+        "domain": state_obj.domain,
+        "state": state_obj.state,
+        "area": area_lookup.get(entity_id),
+        "attributes": attrs,
+    }
+
+
+@tool(parse_docstring=True)
+async def mochi_seek(  # noqa: D417
+    queries: list[str],
+    *,
+    config: Annotated[RunnableConfig, InjectedToolArg()],
+    store: Annotated[BaseStore, InjectedStore()],
+) -> str:
+    """
+    Read-only: search the home by natural language and return condensed live state.
+
+    This tool never calls services or changes devices — use HassTurnOn, HassTurnOff,
+    or other HA tools to act. mochi_seek only reads hass.states (see + attributes).
+
+    Pass short, human phrases — e.g. "living room temperature", "kitchen lights",
+    "front porch camera". Prefer broad physical descriptions over raw entity_ids
+    (vectors match meaning better than underscores or camelCase).
+
+    For two or more unrelated topics in one turn, pass multiple strings in a single
+    call, e.g. ["kitchen temperature", "back door lock"] — each entry gets its own
+    embedding search, then results are merged.
+
+    Args:
+        queries: Discrete search strings; one vector search runs per list entry.
+
+    """
+    if "configurable" not in config:
+        return "Configuration not found. Please check your setup."
+
+    runtime_data = config["configurable"].get("runtime_data")
+    if runtime_data is not None and not runtime_data.entity_index_ready:
+        return "Entity index is still warming up — try again in a moment."
+
+    cleaned = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+    if not cleaned:
+        return "Provide at least one non-empty string in `queries`."
+
+    hass: HomeAssistant = config["configurable"]["hass"]
+    tool_mgr_data = config["configurable"].get("tool_mgr_data", {})
+    threshold = tool_mgr_data.get(
+        CONF_TOOL_RELEVANCE_THRESHOLD, RECOMMENDED_TOOL_RELEVANCE_THRESHOLD
+    )
+
+    async def _search_one(query: str) -> list[tuple[str, float]]:
+        formatted = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(query=query)
+        raw = await store.asearch(
+            ENTITY_INDEX_NAMESPACE, query=formatted, limit=MOCHI_SEEK_PER_QUERY_LIMIT
+        )
+        out: list[tuple[str, float]] = []
+        for item in raw:
+            eid = str(item.key)
+            sc_raw = getattr(item, "score", None)
+            sc_f = float(sc_raw) if sc_raw is not None else 1.0
+            if sc_f < threshold:
+                continue
+            out.append((eid, sc_f))
+        return out
+
+    gathered = await asyncio.gather(
+        *(_search_one(q) for q in cleaned),
+        return_exceptions=True,
+    )
+    best: dict[str, float] = {}
+    for res in gathered:
+        if not isinstance(res, list):
+            LOGGER.error("mochi_seek search failed: %s", res, exc_info=res)
+            continue
+        for eid, sc in res:
+            prev = best.get(eid)
+            if prev is None or sc > prev:
+                best[eid] = sc
+
+    if not best:
+        return (
+            "No matching entities found (vector search empty or below relevance). "
+            "Try different phrasing or broader location/device words."
+        )
+
+    ranked = sorted(best.items(), key=lambda kv: -kv[1])[:MOCHI_SEEK_MAX_ENTITIES]
+    area_lookup = _build_area_lookup(hass)
+    entities_out: list[dict[str, Any]] = []
+    for entity_id, _score in ranked:
+        row = _mochi_seek_condense_entity(hass, entity_id, area_lookup=area_lookup)
+        if row is not None:
+            entities_out.append(row)
+
+    if not entities_out:
+        return "Matched entities are no longer present in Home Assistant state."
+
+    return yaml.dump(
+        {"entities": entities_out},
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+    )
 
 
 def _map_alarm_service(tool_name: str, requested_state: str) -> str:
@@ -1238,8 +1365,8 @@ async def get_entity_history(  # noqa: D417
 
 
 ###
-# This tool has been replaced by the HA native tool GetLiveContext.
-# It is no longer used. Keeping it here for reference only.
+# Deprecated: replaced by mochi_seek for semantic entity lookup + live state.
+# Kept for reference only; not exposed to the model.
 ###
 @tool(parse_docstring=True)
 async def get_current_device_state(  # noqa: D417

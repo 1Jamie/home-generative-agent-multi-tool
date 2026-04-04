@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from ..const import EMBEDDING_INDEX_TEXT_MAX_CHARS  # noqa: TID252
+
 _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _JINJA_BLOCK = re.compile(r"\{%-?.*?-?%\}", re.DOTALL)
 _JINJA_VAR = re.compile(r"\{\{.*?\}\}", re.DOTALL)
@@ -18,6 +20,20 @@ def strip_for_embedding(text: str) -> str:
     out = _JINJA_BLOCK.sub(" ", out)
     out = _JINJA_VAR.sub("[value]", out)
     return re.sub(r"\s+", " ", out).strip()
+
+
+def truncate_for_embedding_index(
+    text: str,
+    *,
+    max_chars: int = EMBEDDING_INDEX_TEXT_MAX_CHARS,
+) -> str:
+    """Trim text for pgvector `content` so Ollama embed stays under per-input limits."""
+    if not text:
+        return ""
+    t = text.strip()
+    if len(t) <= max_chars:
+        return t
+    return f"{t[: max_chars - 3]}..."
 
 
 def fused_similarity(

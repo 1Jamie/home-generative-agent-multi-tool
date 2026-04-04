@@ -10,10 +10,20 @@ from custom_components.home_generative_agent.agent.rag_embedding_text import (
     fused_similarity,
     instruction_keys_fused_from_search_results,
     strip_for_embedding,
+    truncate_for_embedding_index,
 )
 from custom_components.home_generative_agent.const import (
+    EMBEDDING_INDEX_TEXT_MAX_CHARS,
     RECOMMENDED_INSTRUCTION_RAG_NOISE_FLOOR,
 )
+
+
+def test_truncate_for_embedding_index_caps_length() -> None:
+    """Indexed content must stay under Ollama per-input embed limits."""
+    long = "x" * (EMBEDDING_INDEX_TEXT_MAX_CHARS + 500)
+    out = truncate_for_embedding_index(long)
+    assert len(out) == EMBEDDING_INDEX_TEXT_MAX_CHARS
+    assert out.endswith("...")
 
 
 def test_strip_for_embedding_preserves_word_boundaries() -> None:

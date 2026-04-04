@@ -17,6 +17,12 @@ SUBENTRY_TYPE_STT_PROVIDER = "stt_provider"
 SUBENTRY_TYPE_SENTINEL = "sentinel"
 SUBENTRY_TYPE_TOOL_MANAGER = "tool_manager"
 
+
+def tool_manager_subentry_unique_id(config_entry_id: str) -> str:
+    """Stable unique_id for the auto-created tool manager subentry."""
+    return f"{config_entry_id}_tool_manager"
+
+
 HTTP_STATUS_UNAUTHORIZED = 401
 HTTP_STATUS_BAD_REQUEST = 400
 HTTP_STATUS_WEBPAGE_NOT_FOUND = 404
@@ -553,6 +559,9 @@ RECOMMENDED_GEMINI_EMBEDDING_MODEL: EMBEDDING_MODEL_GEMINI_SUPPORTED = (
 
 EMBEDDING_MODEL_DIMS = 1024
 EMBEDDING_MODEL_CTX = 512
+# Max characters embedded per vector-store `content` row
+# (Ollama: per-input context limit).
+EMBEDDING_INDEX_TEXT_MAX_CHARS = 1200
 EMBEDDING_MODEL_PROMPT_TEMPLATE = """
 Represent this sentence for searching relevant passages: {query}
 """
@@ -667,6 +676,124 @@ CONF_INSTRUCTION_RAG_INTENT_WEIGHT = "instruction_rag_intent_weight"
 RECOMMENDED_INSTRUCTION_RAG_INTENT_WEIGHT = 0.65
 
 RECOMMENDED_INSTRUCTION_RAG_NOISE_FLOOR = 0.25
+
+# MOCHI tool gate: when RAG instructions are present, drop read-only tools unless the
+# query or retrieved tool set suggests actuation (prefix / keywords). Escape hatch:
+# get_available_tools is never removed.
+CONF_MOCHI_TOOL_GATE_ENABLED = "mochi_tool_gate_enabled"
+RECOMMENDED_MOCHI_TOOL_GATE_ENABLED = True
+
+# User utterance hints (word-boundary matched in graph._mochi_query_suggests_actuation).
+MOCHI_ACTUATION_QUERY_KEYWORDS: frozenset[str] = frozenset(
+    (
+        "turn",
+        "switch",
+        "lock",
+        "unlock",
+        "open",
+        "close",
+        "set",
+        "activate",
+        "deactivate",
+        "arm",
+        "disarm",
+        "start",
+        "stop",
+        "dim",
+        "brighten",
+        "play",
+        "pause",
+        "mute",
+        "run",
+        "trigger",
+        "enable",
+        "disable",
+        "toggle",
+    )
+)
+
+# Home Assistant intent tools: actuation families (stable across many HA versions).
+MOCHI_HA_ACTUATION_TOOL_PREFIXES: tuple[str, ...] = (
+    "HassTurn",
+    "HassLight",
+    "HassLock",
+    "HassCover",
+    "HassClimate",
+    "HassVacuum",
+    "HassMedia",
+    "HassValve",
+    "HassFan",
+    "HassWaterHeater",
+)
+
+# LangChain tools that mutate state or need explicit user action (never pruned).
+MOCHI_LANGCHAIN_ACTUATION_TOOL_NAMES: frozenset[str] = frozenset(
+    (
+        "alarm_control",
+        "confirm_sensitive_action",
+        "write_yaml_file",
+        "add_automation",
+    )
+)
+
+# Keyword actuation merge in graph (prompt-named PIN + alarm). Not add_automation /
+# write_yaml_file — those stay RAG-only to avoid huge tool lists on every "turn on".
+MOCHI_LANGCHAIN_KEYWORD_EXPAND_TOOL_NAMES: frozenset[str] = frozenset(
+    (
+        "alarm_control",
+        "confirm_sensitive_action",
+    )
+)
+
+# LangChain tools named in the always-on system prompt (see
+# ``vlm_capability_agent_context_append``). When enabled in Tool Manager they must be
+# bound whenever the prompt mentions them — RAG can miss them; do not list them in
+# :data:`MOCHI_PRUNABLE_INFORMATIONAL_TOOL_NAMES` or the MOCHI gate will strip them.
+LANGCHAIN_SYSTEM_PROMPT_NAMED_TOOL_NAMES: frozenset[str] = frozenset(
+    (
+        "get_and_analyze_camera_image",
+    )
+)
+
+# Read-heavy tools to drop when instructions match and actuation is absent.
+# Note: mochi_seek is intentionally omitted - it is always injected like
+# get_available_tools. Camera image analysis is omitted — it is named in the VLM profile
+# block and merged via :data:`LANGCHAIN_SYSTEM_PROMPT_NAMED_TOOL_NAMES`.
+MOCHI_PRUNABLE_INFORMATIONAL_TOOL_NAMES: frozenset[str] = frozenset(
+    (
+        "get_entity_history",
+        "get_camera_last_events",
+    )
+)
+
+# Home Assistant built-in LLM tool (suppressed in favor of mochi_seek).
+HA_TOOL_GET_LIVE_CONTEXT = "GetLiveContext"
+
+# mochi_seek: cap entities returned; per-query ANN limit is applied before merge/dedupe.
+MOCHI_SEEK_MAX_ENTITIES = 48
+MOCHI_SEEK_PER_QUERY_LIMIT = 12
+
+# Strip UI-oriented state attributes from tool output
+# (friendly_name is omitted; use search).
+MOCHI_SEEK_DROP_ENTITY_ATTRIBUTES: frozenset[str] = frozenset(
+    ("icon", "entity_picture", "supported_features", "friendly_name")
+)
+
+MOCHI_SEEK_PRIMARY_CONTEXT_PROMPT = """
+<mochi_seek_guidance>
+Use the "mochi_seek" tool as your primary way to inspect current home state. It is
+read-only (no services, no state changes). To turn devices on/off or otherwise act,
+use HassTurnOn, HassTurnOff, or the appropriate HA intent tools — not mochi_seek.
+
+Pass one or more short, discrete search strings in `queries` (e.g. "kitchen lights",
+"living room temperature", "back door lock"). Include area or room words when it helps
+disambiguate. For several unrelated things at once, use multiple list entries in a
+single call (each gets its own embedding search), e.g.
+["kitchen temperature", "back door lock"].
+Prefer human descriptions over raw entity_ids. Live values always come from the tool
+response (hass.states), not from embeddings.
+</mochi_seek_guidance>
+"""
 
 TOOL_CALL_ERROR_SYSTEM_MESSAGE = """
 

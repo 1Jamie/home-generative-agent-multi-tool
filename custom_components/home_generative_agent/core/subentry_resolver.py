@@ -119,6 +119,8 @@ from ..const import (  # noqa: TID252
     SUBENTRY_TYPE_FEATURE,
     SUBENTRY_TYPE_MODEL_PROVIDER,
     SUBENTRY_TYPE_SENTINEL,
+    SUBENTRY_TYPE_TOOL_MANAGER,
+    tool_manager_subentry_unique_id,
 )
 from .db_utils import build_postgres_uri
 from .subentry_types import FeatureConfig, ModelProviderConfig, ProviderType
@@ -201,6 +203,28 @@ def get_sentinel_subentry(
         if subentry.subentry_type == SUBENTRY_TYPE_SENTINEL:
             return subentry
     return None
+
+
+def get_tool_manager_subentry(config_entry: ConfigEntry) -> ConfigSubentry | None:
+    """Return the tool manager subentry, preferring the canonical unique_id."""
+    matches = [
+        s
+        for s in config_entry.subentries.values()
+        if s.subentry_type == SUBENTRY_TYPE_TOOL_MANAGER
+    ]
+    if not matches:
+        return None
+    canonical = tool_manager_subentry_unique_id(config_entry.entry_id)
+    for sub in matches:
+        if getattr(sub, "unique_id", None) == canonical:
+            return sub
+    if len(matches) == 1:
+        return matches[0]
+    LOGGER.warning(
+        "Multiple tool_manager subentries for %s; using first match (consider merging)",
+        config_entry.entry_id,
+    )
+    return matches[0]
 
 
 def _apply_sentinel_options(

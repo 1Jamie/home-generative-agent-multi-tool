@@ -6,19 +6,26 @@
 > 
 > But then I hit another wall: HGA dumps *every single tool* into every prompt, and its design is hard-limited to only allow one tool provider at a time. I wanted to add more tools and use multiple providers, but I quickly realized that doing so would just pollute the prompt all over again with massive tool lists.
 > 
-> To fix that, I added the RAG tool system so it only pulls the tools it actually needs. But I didn't stop there. I wanted the ability to do exact prompt assembly because I was tired of trying to pack every single behavioral rule into one massive system prompt or a bunch of hacked up tool prompts/descriptions. So, I added custom tags and the ability to attach custom prompt chunks directly to specific tools (on top of their standard descriptions) to help alleviate that and allow for fine-tuning.
+> To fix that, I built a Semantic Context Engine so it only pulls the tools and context it actually needs. I was tired of trying to pack every single behavioral rule into one massive system prompt or a bunch of hacked up tool descriptions.
 > 
-> The trick is that, if the system is set up correctly, every single prompt becomes highly specialized. It only has exactly what it needs for that specific task. Instead of feeding an 8B model a 1k+ token system prompt that causes it to go insane, it gets a lean, laser-focused instruction set.
+> Mochi doesn't just build a prompt; she orchestrates a Semantic State Graph. Before a single token is generated, the engine performs dual-channel vector fusion to identify intent, resolves entity IDs through a private ANN index, and applies a heuristic gate to prune the tool-set. The result is that every turn gets a highly specialized, lean, laser-focused instruction set, keeping even 8B models fast and coherent.
 > 
 > ### The Core Architecture Shift
 > 
-> * **Dynamic Tool RAG:** Instead of feeding the model every tool at once, this uses semantic RAG to only bind the tools relevant to the current conversation.
-> * **The 3.5-Tier System:** The prompt is broken down so it only has the pieces it needs, exactly when it needs them:
+> * **Semantic Context Dispatch:** The system performs concurrent multi-vector ANN queries to survey the home state and available tools. Instead of a linear pipeline, it uses parallel retrieval to only bind what's relevant to the current conversation.
+> * **Dual-Channel Instruction Retrieval:** Custom instructions aren't just fetched by keyword. They are scored on *both* an intent channel (name/tags embedding) and a body channel (content embedding), fused using an alpha-bias slider with noise-floor filtering (Hybrid Search Orchestration).
+> * **Semantic Intent Classification (Mochi Tool Gate):** A heuristic intent gate inspects both your query and the retrieved tool-set to detect if you want to actuate a device. If no actuation is detected, read-only and informational tools are aggressively pruned.
+> * **Tiered Prompt Rendering (The 3.5 Tiers):** The "3.5 Tiers" are the final formatting stage, where the retrieved data is rendered via Jinja2. Because Jinja2 can do logic, templates can execute *before* generation (e.g., grabbing sensor state or image descriptions). The tiers are:
 >   * **Tier 1 (Core):** The generalized system prompt (persona, etc.).
->   * **Tier 1.5 (Retrieved):** Custom instruction chunks dynamically injected via RAG.
+>   * **Tier 1.5 (Retrieved):** The custom instruction chunks injected by the dual-channel RAG.
 >   * **Tier 2 (Provider):** Specific context for the tool provider (e.g., local Ollama vs. Cloud).
->   * **Tier 3 (Tool-Level):** Specialized Jinja2 prompt chunks for the individual tools.
-> * **Jinja2 Logic Injection:** This is the crazy part. Because Jinja2 can do logic, sorting, and filtering, we can build intelligent templates that execute *before* generation. For example, if you ask about your house, it triggers the template, grabs the sensor state, does an image description, and injects that directly into the prompt chunk.
+>   * **Tier 3 (Tool-Level):** Specialized prompt chunks for the individual tools.
+> 
+> ### mochi_seek: Semantic Entity Resolution Engine
+> 
+> `mochi_seek` is the secret sauce that keeps small edge models fast. Instead of dumping your entire Home Assistant entity list into the LLM context, `mochi_seek` acts as a JIT (Just-In-Time) database query using a private ANN index over your HA entity metadata.
+> 
+> When you ask about "the light in the ferret room," the vector index translates that natural language into `light.ferret_room_main` and retrieves its live state. The model never has to see or hold the full entity list in its "working memory," saving massive amounts of context tokens while allowing seamless natural-language device references.
 > 
 > ### Why This Matters
 > 
@@ -36,7 +43,7 @@
 > * **VLM capability:** Camera analysis has Basic / Standard / Advanced profiles (full table under Configuration); the chat model gets a small matching hint so it doesn't fight your setting.
 > * **Ollama reasoning:** Optional reasoning pass for Ollama models that actually support it, per feature, when you enable it on the model step.
 > 
-> **Note:** Existing installations are automatically migrated on first boot. I will attempt to track upstream changes where possible, but honestly, this is a very novel system at this point.
+> **Note:** Existing installations are automatically migrated on first boot. I will attempt to track upstream changes where possible, but honestly, I have changed a lot lol.
 
 [![GitHub Release][releases-shield]][releases]
 [![GitHub Activity][commits-shield]][commits]

@@ -26,7 +26,7 @@ from homeassistant.helpers.selector import (
     TextSelector,
 )
 
-from ..const import (  # noqa: TID252
+from custom_components.home_generative_agent.const import (
     CONF_INSTRUCTION_RAG_INTENT_WEIGHT,
     CONF_INSTRUCTION_RELEVANCE_THRESHOLD,
     CONF_INSTRUCTION_RETRIEVAL_LIMIT,
@@ -38,7 +38,9 @@ from ..const import (  # noqa: TID252
     RECOMMENDED_INSTRUCTION_RETRIEVAL_LIMIT,
     RECOMMENDED_TOOL_RELEVANCE_THRESHOLD,
     RECOMMENDED_TOOL_RETRIEVAL_LIMIT,
-    SUBENTRY_TYPE_TOOL_MANAGER,
+)
+from custom_components.home_generative_agent.core.subentry_resolver import (
+    get_tool_manager_subentry,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +66,7 @@ _INTERNAL_TOOL_NAMES = (
     "resolve_entity_ids",
     "write_yaml_file",
     "get_available_tools",
+    "mochi_seek",
     "add_automation",
 )
 
@@ -76,15 +79,7 @@ def _current_subentry(flow: ConfigSubentryFlow) -> ConfigSubentry | None:
         subentry_id = flow.context.get("subentry_id")
     if subentry_id:
         return entry.subentries.get(subentry_id)
-    if flow.source == SOURCE_RECONFIGURE:
-        matches = [
-            subentry
-            for subentry in entry.subentries.values()
-            if subentry.subentry_type == SUBENTRY_TYPE_TOOL_MANAGER
-        ]
-        if len(matches) == 1:
-            return matches[0]
-    return None
+    return get_tool_manager_subentry(entry)
 
 
 class ToolManagerSubentryFlow(ConfigSubentryFlow):
@@ -359,10 +354,11 @@ class ToolManagerSubentryFlow(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         if user_input is not None:
             providers = self._payload.setdefault(CONF_TOOL_PROVIDERS, {})
+            prev = providers.get(self._provider_to_edit, {})
             providers[self._provider_to_edit] = {
                 "enabled": user_input.get("enabled", True),
-                "prompt": user_input.get("prompt", ""),
-                "tags": user_input.get("tags", ""),
+                "prompt": user_input.get("prompt", prev.get("prompt", "")),
+                "tags": user_input.get("tags", prev.get("tags", "")),
             }
             return await self.async_step_user()
 
@@ -402,10 +398,11 @@ class ToolManagerSubentryFlow(ConfigSubentryFlow):
     ) -> SubentryFlowResult:
         if user_input is not None:
             tools = self._payload.setdefault(CONF_TOOLS_CONFIG, {})
+            prev = tools.get(self._tool_to_edit, {})
             tools[self._tool_to_edit] = {
                 "enabled": user_input.get("enabled", True),
-                "prompt": user_input.get("prompt", ""),
-                "tags": user_input.get("tags", ""),
+                "prompt": user_input.get("prompt", prev.get("prompt", "")),
+                "tags": user_input.get("tags", prev.get("tags", "")),
             }
             return await self.async_step_user()
 
@@ -467,10 +464,11 @@ class ToolManagerSubentryFlow(ConfigSubentryFlow):
             elif user_input.get("delete_entry"):
                 instructions.pop(self._instruction_to_edit, None)
             else:
+                prev = instructions.get(self._instruction_to_edit, {})
                 instructions[self._instruction_to_edit] = {
                     "enabled": user_input.get("enabled", True),
-                    "prompt": user_input.get("prompt", ""),
-                    "tags": user_input.get("tags", ""),
+                    "prompt": user_input.get("prompt", prev.get("prompt", "")),
+                    "tags": user_input.get("tags", prev.get("tags", "")),
                 }
             return await self.async_step_user()
 

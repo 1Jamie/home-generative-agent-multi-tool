@@ -33,6 +33,8 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.area_registry import EVENT_AREA_REGISTRY_UPDATED
+from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.network import get_url
 from homeassistant.helpers.target import (
@@ -200,8 +202,15 @@ from .const import (
     VLM_NUM_PREDICT,
     VLM_REPEAT_PENALTY,
     VLM_TOP_P,
+    tool_manager_subentry_unique_id,
 )
 from .core.db_utils import parse_postgres_uri
+from .core.entity_index import (
+    ENTITY_INDEX_DEBOUNCE_S,
+    EntityIndexStore,
+    build_entity_fingerprint,
+    index_entities_for_mochi_seek,
+)
 from .core.migrations import migrate_person_gallery
 from .core.person_gallery import PersonGalleryDAO
 from .core.runtime import HGAConfigEntry, HGAData
@@ -989,9 +998,11 @@ def _ensure_default_tool_manager_subentry(
     """Ensure a singleton tool manager subentry exists for deterministic settings."""
     from .const import (  # noqa: PLC0415
         CONF_INSTRUCTION_RAG_INTENT_WEIGHT,
+        CONF_MOCHI_TOOL_GATE_ENABLED,
         CONF_TOOL_RELEVANCE_THRESHOLD,
         CONF_TOOL_RETRIEVAL_LIMIT,
         RECOMMENDED_INSTRUCTION_RAG_INTENT_WEIGHT,
+        RECOMMENDED_MOCHI_TOOL_GATE_ENABLED,
         RECOMMENDED_TOOL_RELEVANCE_THRESHOLD,
         RECOMMENDED_TOOL_RETRIEVAL_LIMIT,
     )
@@ -1013,13 +1024,17 @@ def _ensure_default_tool_manager_subentry(
             CONF_INSTRUCTION_RAG_INTENT_WEIGHT,
             RECOMMENDED_INSTRUCTION_RAG_INTENT_WEIGHT,
         ),
+        CONF_MOCHI_TOOL_GATE_ENABLED: entry.options.get(
+            CONF_MOCHI_TOOL_GATE_ENABLED,
+            RECOMMENDED_MOCHI_TOOL_GATE_ENABLED,
+        ),
         "tool_providers": {},
         "tools": {},
     }
     subentry = ConfigSubentry(
         subentry_type=SUBENTRY_TYPE_TOOL_MANAGER,
         title="Tool Manager",
-        unique_id=f"{entry.entry_id}_tool_manager",
+        unique_id=tool_manager_subentry_unique_id(entry.entry_id),
         data=MappingProxyType(payload),
     )
     hass.config_entries.async_add_subentry(entry, subentry)
@@ -1385,12 +1400,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
     ollama_embeddings: OllamaEmbeddings | None = None
     if ollama_health.get(base_ollama_url):
         try:
-            ollama_embeddings = OllamaEmbeddings(
-                model=options.get(
-                    CONF_OLLAMA_EMBEDDING_MODEL, RECOMMENDED_OLLAMA_EMBEDDING_MODEL
-                ),
-                base_url=base_ollama_url,
-                num_ctx=EMBEDDING_MODEL_CTX,
+
+            def _make_ollama_embeddings() -> OllamaEmbeddings:
+                # Constructor loads SSL trust store; must not run on the event loop.
+                return OllamaEmbeddings(
+                    model=options.get(
+                        CONF_OLLAMA_EMBEDDING_MODEL, RECOMMENDED_OLLAMA_EMBEDDING_MODEL
+                    ),
+                    base_url=base_ollama_url,
+                    num_ctx=EMBEDDING_MODEL_CTX,
+                )
+
+            ollama_embeddings = await hass.async_add_executor_job(
+                _make_ollama_embeddings
             )
         except Exception:
             LOGGER.exception("Ollama embeddings init failed; continuing without them.")
@@ -1883,6 +1905,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
         baseline_updater=baseline_updater,
     )
 
+    if pool is None:
+        entry.runtime_data.entity_index_ready = True
+    else:
+
+        async def _run_entity_index() -> None:
+            task = asyncio.current_task()
+            try:
+                await asyncio.sleep(ENTITY_INDEX_DEBOUNCE_S)
+                rd = entry.runtime_data
+                store = rd.store
+                index_store = EntityIndexStore(hass)
+                current_fp = build_entity_fingerprint(hass)
+                saved_fp = await index_store.async_load()
+                if current_fp == saved_fp:
+                    LOGGER.debug(
+                        "MochiSeek entity index: fingerprint unchanged, "
+                        "skipping re-index"
+                    )
+                    rd.entity_index_ready = True
+                    return
+                await index_entities_for_mochi_seek(hass, store)
+                await index_store.async_save(current_fp)
+                rd.entity_index_ready = True
+                LOGGER.debug("MochiSeek entity index ready")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("MochiSeek entity index failed")
+            finally:
+                if task is None or not task.cancelled():
+                    rd = entry.runtime_data
+                    if rd.entity_index_needs_rerun:
+                        rd.entity_index_needs_rerun = False
+                        _schedule_entity_index()
+
+        def _schedule_entity_index(_event: object | None = None) -> None:
+            """Marshaling: bus listeners may run on a worker thread."""
+
+            def _enqueue() -> None:
+                rd = entry.runtime_data
+                existing = rd.entity_index_task
+                if existing is not None and not existing.done():
+                    rd.entity_index_needs_rerun = True
+                    return
+                rd.entity_index_task = hass.async_create_task(_run_entity_index())
+
+            hass.loop.call_soon_threadsafe(_enqueue)
+
+        if hass.is_running:
+            _schedule_entity_index()
+        else:
+            hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, _schedule_entity_index
+            )
+
+        entry.async_on_unload(
+            hass.bus.async_listen(EVENT_ENTITY_REGISTRY_UPDATED, _schedule_entity_index)
+        )
+        entry.async_on_unload(
+            hass.bus.async_listen(EVENT_AREA_REGISTRY_UPDATED, _schedule_entity_index)
+        )
+
     if not hass.data[DOMAIN].get("http_registered"):
         hass.http.register_view(EnrollPersonView(hass, entry))
         www_dir = await hass.async_add_executor_job(_resolve_www_dir)
@@ -2363,6 +2447,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool
     if entry.runtime_data.notifier is not None:
         entry.runtime_data.notifier.stop()
 
+    entry.runtime_data.entity_index_needs_rerun = False
+    entity_index_task = entry.runtime_data.entity_index_task
+    if entity_index_task is not None and not entity_index_task.done():
+        entity_index_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await entity_index_task
+
     # Clean up LangGraph store background task (AsyncBatchedBaseStore / PostgresStore).
     # Avoids "Task was destroyed but it is pending!" if unload does not await the task.
     store = entry.runtime_data.store
@@ -2374,6 +2465,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool
             await task
 
     if entry.runtime_data.pool is not None:
+        gate = entry.runtime_data.graph_invocation_gate
+        if not await gate.wait_idle(timeout_s=120.0):
+            LOGGER.warning(
+                "HGA: graph or vector indexing still active after 120s; closing pool"
+            )
         await entry.runtime_data.pool.close()
     await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return True

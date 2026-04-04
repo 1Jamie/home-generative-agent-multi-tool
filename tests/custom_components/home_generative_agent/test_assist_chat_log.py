@@ -5,14 +5,56 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+from homeassistant.components.conversation.chat_log import (
+    AssistantContent,
+    ToolResultContent,
+)
 from homeassistant.helpers import intent, llm
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from custom_components.home_generative_agent.core.assist_chat_log import (
     _delta_stream,
     append_langgraph_turn_to_chat_log,
+    ensure_chat_log_ends_with_assistant,
     turn_messages_for_chat_log,
 )
+
+# ── ensure_chat_log_ends_with_assistant ───────────────────────────────────────
+
+
+def test_ensure_chat_log_appends_assistant_when_last_is_tool_result() -> None:
+    """async_get_result_from_chat_log requires AssistantContent as final row."""
+    chat_log = MagicMock()
+    chat_log.content = [
+        ToolResultContent(
+            agent_id="conversation.test",
+            tool_call_id="c1",
+            tool_name="mochi_seek",
+            tool_result={"ok": True},
+        )
+    ]
+    ensure_chat_log_ends_with_assistant(
+        chat_log, agent_id="conversation.home_generative_agent"
+    )
+    chat_log.async_add_assistant_content_without_tools.assert_called_once()
+    added = chat_log.async_add_assistant_content_without_tools.call_args[0][0]
+    assert isinstance(added, AssistantContent)
+    assert added.agent_id == "conversation.home_generative_agent"
+    assert added.content is None
+
+
+def test_ensure_chat_log_noop_when_last_is_assistant() -> None:
+    """Do not append when the log already ends with an assistant row."""
+    chat_log = MagicMock()
+    chat_log.content = [
+        AssistantContent(
+            agent_id="conversation.test",
+            content="Done.",
+        )
+    ]
+    ensure_chat_log_ends_with_assistant(chat_log, agent_id="conversation.test")
+    chat_log.async_add_assistant_content_without_tools.assert_not_called()
+
 
 # ── turn_messages_for_chat_log ───────────────────────────────────────────────
 
@@ -162,6 +204,34 @@ async def test_delta_stream_always_emits_role_and_content() -> None:
     )
     assert any(d.get("role") == "assistant" for d in deltas)
     assert any(d.get("content") == "answer" for d in deltas)
+
+
+async def test_delta_stream_omit_final_spoken_content() -> None:
+    """
+    When live-streamed, skip duplicate final content delta AND the role signal.
+
+    Previously the code always emitted {"role": "assistant"} even when nothing
+    followed it.  That bare role delta leaves the Assist pipeline delta_listener
+    in an 'assistant about to speak' state, causing the frontend '...' indicator
+    to persist after the answer has been fully displayed.  After the fix, an
+    empty turn with omit_final_spoken_content=True and no thinking produces zero
+    deltas.
+    """
+    deltas = await _collect(
+        _delta_stream(
+            [],
+            reasoning_plain="",
+            has_native_thinking=False,
+            debug_assist_trace=False,
+            final_spoken_text="already streamed",
+            ha_tool_intent_responses=None,
+            omit_final_spoken_content=True,
+        )
+    )
+    # No content delta (was already sent live)
+    assert not any(d.get("content") == "already streamed" for d in deltas)
+    # No bare role=assistant delta either - that would reopen a message slot
+    assert not any(d.get("role") == "assistant" for d in deltas)
 
 
 async def test_delta_stream_maps_ha_intent_sidecar_to_intent_response_dict() -> None:
@@ -420,3 +490,55 @@ async def test_append_always_emits_final_content_even_with_empty_turn() -> None:
     assert content_delta is not None
     assert content_delta["content"] == "answer"
     assert any("thinking_content" in d for d in captured)
+
+
+async def test_delta_stream_omit_with_tool_call_no_trailing_role() -> None:
+    """
+    Replay after live-stream: tool row emitted, no trailing bare role=assistant.
+
+    The pipeline delta_listener keeps its chat_log_role as 'tool_result' after
+    the tool row; it must NOT receive a bare {"role": "assistant"} with no
+    content following it, which would leave the Assist frontend '...' open.
+    """
+    turn = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "mochi_seek",
+                    "args": {"queries": ["weather tomorrow"]},
+                    "id": "call_wx",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="weather data",
+            tool_call_id="call_wx",
+            name="mochi_seek",
+        ),
+    ]
+    deltas = await _collect(
+        _delta_stream(
+            turn,
+            reasoning_plain="",
+            has_native_thinking=False,
+            debug_assist_trace=False,
+            final_spoken_text="Tomorrow will be rainy.",
+            ha_tool_intent_responses=None,
+            omit_final_spoken_content=True,  # live-stream path
+        )
+    )
+
+    roles = [d["role"] for d in deltas if "role" in d]
+
+    # tool row present (assistant for tool-call + tool_result)
+    assert "assistant" in roles
+    assert "tool_result" in roles
+
+    # the LAST role delta must NOT be a bare assistant (nothing follows it)
+    assert roles[-1] != "assistant", (
+        "Trailing bare {'role':'assistant'} would leave the Assist UI '...' open"
+    )
+    # no final spoken content emitted (was already streamed live)
+    assert not any(d.get("content") == "Tomorrow will be rainy." for d in deltas)

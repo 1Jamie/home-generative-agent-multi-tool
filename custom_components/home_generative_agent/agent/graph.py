@@ -26,6 +26,7 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util import ulid
 from langchain_core.messages import (
     AIMessage,
+    AIMessageChunk,
     AnyMessage,
     BaseMessage,
     HumanMessage,
@@ -33,7 +34,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.messages.utils import trim_messages
+from langchain_core.messages.utils import message_chunk_to_message, trim_messages
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import ValidationError
 
@@ -47,9 +48,11 @@ from ..const import (  # noqa: TID252
     CONF_INSTRUCTION_RAG_INTENT_WEIGHT,
     CONF_INSTRUCTION_RELEVANCE_THRESHOLD,
     CONF_INSTRUCTION_RETRIEVAL_LIMIT,
+    CONF_INSTRUCTIONS_CONFIG,
     CONF_MANAGE_CONTEXT_WITH_TOKENS,
     CONF_MAX_MESSAGES_IN_CONTEXT,
     CONF_MAX_TOKENS_IN_CONTEXT,
+    CONF_MOCHI_TOOL_GATE_ENABLED,
     CONF_OLLAMA_CHAT_MODEL,
     CONF_OPENAI_CHAT_MODEL,
     CONF_OPENAI_COMPATIBLE_CHAT_MODEL,
@@ -58,11 +61,19 @@ from ..const import (  # noqa: TID252
     CONF_VLM_CAPABILITY,
     EMBEDDING_MODEL_PROMPT_TEMPLATE,
     GRAPH_CFG_HA_TOOL_INTENT_RESPONSES,
+    LANGCHAIN_SYSTEM_PROMPT_NAMED_TOOL_NAMES,
+    MOCHI_ACTUATION_QUERY_KEYWORDS,
+    MOCHI_HA_ACTUATION_TOOL_PREFIXES,
+    MOCHI_LANGCHAIN_ACTUATION_TOOL_NAMES,
+    MOCHI_LANGCHAIN_KEYWORD_EXPAND_TOOL_NAMES,
+    MOCHI_PRUNABLE_INFORMATIONAL_TOOL_NAMES,
+    MOCHI_SEEK_PRIMARY_CONTEXT_PROMPT,
     RECOMMENDED_CRITICAL_ACTIONS,
     RECOMMENDED_INSTRUCTION_RAG_INTENT_WEIGHT,
     RECOMMENDED_INSTRUCTION_RAG_NOISE_FLOOR,
     RECOMMENDED_INSTRUCTION_RELEVANCE_THRESHOLD,
     RECOMMENDED_INSTRUCTION_RETRIEVAL_LIMIT,
+    RECOMMENDED_MOCHI_TOOL_GATE_ENABLED,
     RECOMMENDED_TOOL_RELEVANCE_THRESHOLD,
     RECOMMENDED_TOOL_RETRIEVAL_LIMIT,
     RECOMMENDED_VLM_CAPABILITY,
@@ -178,7 +189,7 @@ async def _precheck_alarm_open_entries(
     if is_disarm:
         return None
 
-    open_entries = await _find_open_entries(ctx.hass, ctx.state["messages"])
+    open_entries = _find_open_entries(ctx.hass)
     if not open_entries:
         return None
 
@@ -510,66 +521,8 @@ def _parse_tool_response(
 # ----- Alarm helpers -----
 
 
-def _extract_last_live_context(messages: list[AnyMessage]) -> str | None:
-    """Return the most recent GetLiveContext payload content, if any."""
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage) and msg.name == "GetLiveContext":
-            raw_content = msg.content
-            if not isinstance(raw_content, str):
-                continue
-            try:
-                data = json.loads(raw_content)
-                if isinstance(data, dict) and "result" in data:
-                    return str(data["result"])
-            except json.JSONDecodeError:
-                pass
-            return raw_content
-    return None
-
-
-def _parse_open_entries_from_live_context(raw: str) -> list[str]:
-    """Best-effort parse of open entry sensors from a Live Context string."""
-    open_entries: list[str] = []
-    current_name: str | None = None
-    is_on = False
-    is_opening = False
-
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # New entry block.
-        if stripped.startswith("- names:"):
-            if current_name and is_on and is_opening:
-                open_entries.append(current_name)
-            current_name = stripped.split(":", maxsplit=1)[1].strip().strip("'\"")
-            is_on = False
-            is_opening = False
-            continue
-        if stripped.startswith("state:"):
-            if re.search(r"['\"]?on['\"]?", stripped, re.IGNORECASE):
-                is_on = True
-            continue
-        if "device_class" in stripped and "opening" in stripped:
-            is_opening = True
-            continue
-
-    if current_name and is_on and is_opening:
-        open_entries.append(current_name)
-    return open_entries
-
-
-async def _find_open_entries(
-    hass: HomeAssistant, messages: list[AnyMessage]
-) -> list[str]:
-    """Find open doors/windows from recent context, falling back to live state."""
-    # First, try the most recent live context already in memory.
-    if (raw_context := _extract_last_live_context(messages)) is not None:
-        entries = _parse_open_entries_from_live_context(raw_context)
-        if entries:
-            return entries
-
-    # Fallback to current HA state for entry sensors.
+def _find_open_entries(hass: HomeAssistant) -> list[str]:
+    """Find open doors/windows from current HA state (opening binary_sensors)."""
     open_entries: list[str] = []
     for entity_id in hass.states.async_entity_ids("binary_sensor"):
         state_obj = hass.states.get(entity_id)
@@ -595,6 +548,95 @@ def _vector_search_result_or_empty(raw: Any, *, label: str) -> list[Any]:
     return raw if isinstance(raw, list) else []
 
 
+def _human_message_plain_text(msg: HumanMessage) -> str:
+    """Flatten HumanMessage content for keyword / embedding-style checks."""
+    content = msg.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(parts)
+    return str(content)
+
+
+def _mochi_query_suggests_actuation(text: str) -> bool:
+    """Return whether user text has actuation keywords (word boundaries)."""
+    if not text.strip():
+        return False
+    lowered = text.lower()
+    for kw in MOCHI_ACTUATION_QUERY_KEYWORDS:
+        if re.search(rf"\b{re.escape(kw)}\b", lowered):
+            return True
+    return False
+
+
+def _mochi_retrieved_suggests_actuation(names: set[str]) -> bool:
+    """Return whether RAG-selected names include HA or LangChain actuation tools."""
+    for name in names:
+        if name in MOCHI_LANGCHAIN_ACTUATION_TOOL_NAMES:
+            return True
+        if any(name.startswith(p) for p in MOCHI_HA_ACTUATION_TOOL_PREFIXES):
+            return True
+    return False
+
+
+def _available_tool_names(available_tools: list[Any]) -> set[str]:
+    """Names of tools the session may bind (conversation adds enabled tools only)."""
+    return {
+        n for n in (_tool_name_from_available_entry(t) for t in available_tools) if n
+    }
+
+
+def _filter_instruction_keys_respecting_enabled(
+    keys: list[str], instructions_cfg: dict[str, Any]
+) -> list[str]:
+    """Drop RAG instruction keys that are disabled in Tool Manager (stale vectors)."""
+    return [k for k in keys if instructions_cfg.get(k, {}).get("enabled", True)]
+
+
+def _tool_name_from_available_entry(entry: Any) -> str:
+    """Resolve tool name from an OpenAI-style dict or a LangChain tool object."""
+    if isinstance(entry, dict):
+        fn = entry.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if name:
+                return str(name)
+        name = entry.get("name")
+        if name:
+            return str(name)
+        return ""
+    return str(getattr(entry, "name", "") or "")
+
+
+def _actuation_binding_tool_names_from_available(
+    available_tools: list[Any],
+) -> set[str]:
+    """
+    Tool names to bind when the user query suggests actuation.
+
+    Includes Home Assistant ``Hass*`` intent tools and LangChain tools in
+    :data:`MOCHI_LANGCHAIN_KEYWORD_EXPAND_TOOL_NAMES` that appear in
+    ``available_tools``. Uses :data:`MOCHI_HA_ACTUATION_TOOL_PREFIXES` for Hass
+    intents. Other LangChain tools (e.g. ``add_automation``) stay RAG-selected.
+    """
+    out: set[str] = set()
+    for entry in available_tools:
+        name = _tool_name_from_available_entry(entry)
+        if not name:
+            continue
+        if name in MOCHI_LANGCHAIN_KEYWORD_EXPAND_TOOL_NAMES:
+            out.add(name)
+            continue
+        if any(name.startswith(p) for p in MOCHI_HA_ACTUATION_TOOL_PREFIXES):
+            out.add(name)
+    return out
+
+
 async def _retrieve_tools(
     state: State, config: RunnableConfig, *, store: BaseStore
 ) -> dict[str, Any]:
@@ -613,6 +655,8 @@ async def _retrieve_tools(
         }
 
     tool_mgr_data = config["configurable"].get("tool_mgr_data", {})
+    available_tools = config["configurable"].get("available_tools", [])
+    available_tool_names = _available_tool_names(available_tools)
     limit = tool_mgr_data.get(
         CONF_TOOL_RETRIEVAL_LIMIT, RECOMMENDED_TOOL_RETRIEVAL_LIMIT
     )
@@ -620,7 +664,9 @@ async def _retrieve_tools(
         CONF_TOOL_RELEVANCE_THRESHOLD, RECOMMENDED_TOOL_RELEVANCE_THRESHOLD
     )
 
-    query_prompt = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(query=last_message.content)
+    query_prompt = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(
+        query=_human_message_plain_text(last_message)
+    )
     instruction_limit = tool_mgr_data.get(
         CONF_INSTRUCTION_RETRIEVAL_LIMIT, RECOMMENDED_INSTRUCTION_RETRIEVAL_LIMIT
     )
@@ -669,8 +715,24 @@ async def _retrieve_tools(
             continue
         retrieved_names.add(item.key)
 
-    # Always include the escape hatch tool
-    retrieved_names.add("get_available_tools")
+    # Drop vector hits for tools not in the session (disabled in Tool Manager or stale).
+    retrieved_names = {k for k in retrieved_names if k in available_tool_names}
+
+    # Discovery + home state: only if still enabled (available_tools is filtered in UI).
+    if "get_available_tools" in available_tool_names:
+        retrieved_names.add("get_available_tools")
+    if "mochi_seek" in available_tool_names:
+        retrieved_names.add("mochi_seek")
+
+    # Tier-1 prompt names these tools (VLM profile → get_and_analyze_camera_image).
+    retrieved_names |= LANGCHAIN_SYSTEM_PROMPT_NAMED_TOOL_NAMES & available_tool_names
+
+    # RAG can miss Hass* intents (embedding / threshold). We still inject
+    # MOCHI_SEEK_PRIMARY_CONTEXT_PROMPT, which names HassTurnOn/HassTurnOff — if those
+    # tools are not bound, models often emit JSON as plain text instead of tool_calls.
+    plain = _human_message_plain_text(last_message)
+    if _mochi_query_suggests_actuation(plain):
+        retrieved_names |= _actuation_binding_tool_names_from_available(available_tools)
 
     retrieved_instructions = instruction_keys_fused_from_search_results(
         instruction_intent_items,
@@ -681,13 +743,62 @@ async def _retrieve_tools(
         noise_floor=RECOMMENDED_INSTRUCTION_RAG_NOISE_FLOOR,
     )
 
+    instructions_cfg = tool_mgr_data.get(CONF_INSTRUCTIONS_CONFIG, {})
+    retrieved_instructions = _filter_instruction_keys_respecting_enabled(
+        retrieved_instructions,
+        instructions_cfg,
+    )
+
+    # MOCHI gate: retrieved instructions + no actuation hint → prune read-only tools.
+    if (
+        tool_mgr_data.get(
+            CONF_MOCHI_TOOL_GATE_ENABLED, RECOMMENDED_MOCHI_TOOL_GATE_ENABLED
+        )
+        and retrieved_instructions
+        and not _mochi_query_suggests_actuation(plain)
+        and not _mochi_retrieved_suggests_actuation(retrieved_names)
+    ):
+        prunable_present = retrieved_names & MOCHI_PRUNABLE_INFORMATIONAL_TOOL_NAMES
+        if prunable_present:
+            retrieved_names -= MOCHI_PRUNABLE_INFORMATIONAL_TOOL_NAMES
+            if "get_available_tools" in available_tool_names:
+                retrieved_names.add("get_available_tools")
+            if "mochi_seek" in available_tool_names:
+                retrieved_names.add("mochi_seek")
+            LOGGER.debug(
+                "Mochi tool gate: pruned informational tools %s",
+                prunable_present,
+            )
+
     return {
         "selected_tools": list(retrieved_names),
         "selected_instructions": retrieved_instructions,
     }
 
 
-async def _call_model(  # noqa: PLR0912, PLR0915
+def _inject_pre_fetched_context_into_last_human(
+    messages: list[AnyMessage], *, context_block: str
+) -> None:
+    """Prepend RAG context to the last HumanMessage (local copy; not graph state)."""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not isinstance(msg, HumanMessage):
+            continue
+        orig = msg.content
+        if isinstance(orig, str):
+            messages[i] = msg.model_copy(update={"content": context_block + orig})
+        elif isinstance(orig, list):
+            messages[i] = msg.model_copy(
+                update={
+                    "content": [{"type": "text", "text": context_block}, *orig],
+                }
+            )
+        else:
+            messages[i] = msg.model_copy(update={"content": context_block + str(orig)})
+        return
+
+
+async def _call_model(  # noqa: C901, PLR0912, PLR0915
     state: State, config: RunnableConfig, *, store: BaseStore
 ) -> dict[str, Any]:
     """Coroutine to call the chat model."""
@@ -707,8 +818,7 @@ async def _call_model(  # noqa: PLR0912, PLR0915
     tools_to_bind = [
         t
         for t in available_tools
-        if (t["function"]["name"] if isinstance(t, dict) else getattr(t, "name", ""))
-        in selected_tool_names
+        if _tool_name_from_available_entry(t) in selected_tool_names
     ]
     model = (
         await asyncio.to_thread(model_without_tools.bind_tools, tools_to_bind)
@@ -743,21 +853,25 @@ async def _call_model(  # noqa: PLR0912, PLR0915
             rendered_prompt = _render_prompt(p_cfg["prompt"])
             provider_prompts.append(f"Provider `{p_id}` Context: {rendered_prompt}")
 
-    instruction_prompts = []
+    # Rendered bodies only (no "Instruction `name`:" label); injected on the user turn.
+    instruction_context_blocks: list[str] = []
     selected_instruction_names = state.get("selected_instructions", [])
     if selected_instruction_names:
-        instructions_cfg = tool_mgr_data.get("instructions", {})
+        instructions_cfg = tool_mgr_data.get(CONF_INSTRUCTIONS_CONFIG, {})
         for i_name in selected_instruction_names:
             i_cfg = instructions_cfg.get(i_name, {})
+            if not i_cfg.get("enabled", True):
+                continue
             if i_cfg.get("prompt"):
                 rendered_prompt = _render_prompt(i_cfg["prompt"])
-                instruction_prompts.append(
-                    f"Instruction `{i_name}`:\n{rendered_prompt}"
-                )
+                if rendered_prompt.strip():
+                    instruction_context_blocks.append(rendered_prompt)
 
     tool_prompts = []
     for t_name in selected_tool_names:
         t_cfg = tools_cfg.get(t_name, {})
+        if not t_cfg.get("enabled", True):
+            continue
         if t_cfg.get("prompt"):
             rendered_prompt = _render_prompt(t_cfg["prompt"])
             tool_prompts.append(f"Tool `{t_name}` Instructions:\n{rendered_prompt}")
@@ -766,7 +880,9 @@ async def _call_model(  # noqa: PLR0912, PLR0915
     last_message = state["messages"][-1]
     last_message_from_user = isinstance(last_message, HumanMessage)
     query_prompt = (
-        EMBEDDING_MODEL_PROMPT_TEMPLATE.format(query=last_message.content)
+        EMBEDDING_MODEL_PROMPT_TEMPLATE.format(
+            query=_human_message_plain_text(last_message)
+        )
         if last_message_from_user
         else None
     )
@@ -780,14 +896,6 @@ async def _call_model(  # noqa: PLR0912, PLR0915
     system_message += vlm_capability_agent_context_append(
         str(opts.get(CONF_VLM_CAPABILITY, RECOMMENDED_VLM_CAPABILITY))
     )
-
-    # Tier 1.5: Custom retrieval-based instructions
-    if instruction_prompts:
-        system_message += (
-            "\n\n<custom_instructions>\n"
-            + "\n\n".join(instruction_prompts)
-            + "\n</custom_instructions>"
-        )
 
     if mems:
         formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
@@ -815,8 +923,22 @@ async def _call_model(  # noqa: PLR0912, PLR0915
             + "\n</tool_specific_instructions>"
         )
 
+    langchain_tools = config["configurable"].get("langchain_tools") or {}
+    if "mochi_seek" in langchain_tools and "mochi_seek" in selected_tool_names:
+        system_message += MOCHI_SEEK_PRIMARY_CONTEXT_PROMPT
+
     # Model input = System + current messages.
     messages = [SystemMessage(content=system_message)] + state["messages"]
+
+    # Tier 1.5: prepend retrieved instruction text to the last HumanMessage (RAG+query).
+    if instruction_context_blocks:
+        context_body = "\n\n".join(instruction_context_blocks)
+        context_block = (
+            "<pre_fetched_context>\n" + context_body + "\n</pre_fetched_context>\n\n"
+        )
+        _inject_pre_fetched_context_into_last_human(
+            messages, context_block=context_block
+        )
 
     # Trim messages to manage context window length.
     provider = opts.get(CONF_CHAT_MODEL_PROVIDER)
@@ -855,7 +977,15 @@ async def _call_model(  # noqa: PLR0912, PLR0915
     LOGGER.debug("Model call messages: %s", trimmed_messages)
     LOGGER.debug("Model call messages length: %s", len(trimmed_messages))
 
-    raw_response = await model.ainvoke(trimmed_messages)
+    merged: AIMessageChunk | None = None
+    async for chunk in model.astream(trimmed_messages):
+        merged = chunk if merged is None else merged + chunk
+    if merged is None:
+        msg = "Chat model returned an empty stream."
+        raise HomeAssistantError(msg)
+    raw_response = message_chunk_to_message(merged)
+    if not isinstance(raw_response, AIMessage):
+        raw_response = AIMessage(content=getattr(raw_response, "content", "") or "")
     LOGGER.debug("Raw chat model response: %s", raw_response)
 
     raw_content = getattr(raw_response, "content", "") or ""

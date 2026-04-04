@@ -21,23 +21,94 @@ Therefore the correct path is:
      already stored on ``chat_log.content`` internally).
 
 This ensures every delta reaches the pipeline listener and the frontend.
+
+Official reference (Home Assistant core): ``openai_conversation`` maps one API
+stream per iteration via ``entity._transform_stream`` and
+``entity._async_handle_chat_log`` — see
+``core/homeassistant/components/openai_conversation/entity.py``. That pattern
+yields explicit ``{"role": "assistant"}`` before tool rows and again before the
+next assistant text so the Assist pipeline's sticky ``chat_log_role`` (see
+``assist_pipeline/pipeline.py`` ``chat_log_delta_listener``) stays correct.
+HGA's ``_delta_stream`` mirrors that ordering.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from collections.abc import AsyncGenerator, Mapping, Sequence  # noqa: TC003
+from typing import Any
 
+from homeassistant.components.conversation.chat_log import (
+    AssistantContent,
+    ChatLog,
+    ToolResultContent,
+)
 from homeassistant.helpers import intent, llm
 from homeassistant.util.ulid import ulid_now
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
-if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Mapping, Sequence
-
-    from homeassistant.components.conversation.chat_log import ChatLog
-
 _LOGGER = logging.getLogger(__name__)
+_DELTA_LOG_PREVIEW_CHARS = 80
+
+
+def _summarize_delta_for_log(delta: dict[str, Any]) -> str:
+    """Short single-line summary for DEBUG tracing (avoids huge tool_result bodies)."""
+    parts: list[str] = []
+    if "role" in delta:
+        parts.append(f"role={delta['role']!r}")
+    if "content" in delta:
+        raw = delta["content"]
+        if isinstance(raw, str):
+            prev = raw[:_DELTA_LOG_PREVIEW_CHARS] + (
+                "..." if len(raw) > _DELTA_LOG_PREVIEW_CHARS else ""
+            )
+            parts.append(f"content={len(raw)}ch {prev!r}")
+        else:
+            parts.append(f"content={raw!r}")
+    if "tool_calls" in delta:
+        tc = delta["tool_calls"]
+        n = len(tc) if isinstance(tc, list) else "?"
+        parts.append(f"tool_calls={n}")
+    if "thinking_content" in delta:
+        parts.append("thinking_content=yes")
+    if delta.get("role") == "tool_result":
+        parts.append(f"tool_name={delta.get('tool_name')!r}")
+    return " ".join(parts) if parts else repr(delta)
+
+
+async def _async_iter_with_optional_delta_logging(
+    stream: AsyncGenerator[dict[str, Any]],
+    *,
+    enabled: bool,
+) -> AsyncGenerator[dict[str, Any]]:
+    """Pass through deltas; log each at DEBUG when ``enabled``."""
+    async for d in stream:
+        if enabled:
+            _LOGGER.debug("ChatLog delta: %s", _summarize_delta_for_log(d))
+        yield d
+
+
+def ensure_chat_log_ends_with_assistant(
+    chat_log: ChatLog,
+    *,
+    agent_id: str,
+) -> None:
+    """
+    Align the chat log with ``async_get_result_from_chat_log`` invariants.
+
+    ``conversation.async_get_result_from_chat_log`` requires ``chat_log.content[-1]``
+    to be ``AssistantContent``. ``ChatLog.async_add_delta_content_stream`` can leave
+    the last row as ``ToolResultContent`` when the closing assistant delta had no text
+    and no thinking (e.g. live stream already emitted the answer, replay omits body).
+    """
+    if not chat_log.content:
+        return
+    last = chat_log.content[-1]
+    if not isinstance(last, ToolResultContent):
+        return
+    chat_log.async_add_assistant_content_without_tools(
+        AssistantContent(agent_id=agent_id, content=None)
+    )
 
 
 # ── Turn slicing ────────────────────────────────────────────────────────────
@@ -107,7 +178,7 @@ def _coerce_tool_result(content: Any) -> Any:
 # ── Delta synthesis ─────────────────────────────────────────────────────────
 
 
-async def _delta_stream(  # noqa: PLR0912, PLR0913
+async def _delta_stream(  # noqa: PLR0913
     turn: Sequence[AnyMessage],
     *,
     reasoning_plain: str,
@@ -115,6 +186,7 @@ async def _delta_stream(  # noqa: PLR0912, PLR0913
     debug_assist_trace: bool,
     final_spoken_text: str,
     ha_tool_intent_responses: Mapping[str, intent.IntentResponse] | None,
+    omit_final_spoken_content: bool = False,
 ) -> AsyncGenerator[dict[str, Any]]:
     """
     Yield ``AssistantContentDeltaDict`` / ``ToolResultContentDeltaDict`` items.
@@ -163,17 +235,21 @@ async def _delta_stream(  # noqa: PLR0912, PLR0913
             }
 
     # Final assistant message: answer text + optional thinking_content.
-    if started_first_message:
-        yield {"role": "assistant"}
-    else:
-        yield {"role": "assistant"}
+    # Only emit the role signal when there is something to follow it.
+    # An empty {"role": "assistant"} leaves the pipeline delta_listener in an
+    # "assistant about to speak" state with nothing following, which makes the
+    # Assist frontend show "..." indefinitely after a live-streamed answer.
+    will_have_thinking = show_trace and bool(reasoning_plain.strip())
+    will_have_content = not omit_final_spoken_content and bool(
+        final_spoken_text.strip()
+    )
 
-    if show_trace and reasoning_plain.strip():
-        yield {"thinking_content": reasoning_plain.strip()}
-
-    content_str = final_spoken_text.strip() or None
-    if content_str:
-        yield {"content": content_str}
+    if will_have_thinking or will_have_content:
+        yield {"role": "assistant"}
+        if will_have_thinking:
+            yield {"thinking_content": reasoning_plain.strip()}
+        if will_have_content:
+            yield {"content": final_spoken_text.strip()}
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
@@ -190,6 +266,7 @@ async def append_langgraph_turn_to_chat_log(  # noqa: PLR0913
     debug_assist_trace: bool,
     final_spoken_text: str,
     ha_tool_intent_responses: Mapping[str, intent.IntentResponse] | None = None,
+    omit_final_spoken_content: bool = False,
 ) -> None:
     """
     Drive LangGraph output through ChatLog so the Assist UI receives deltas.
@@ -217,7 +294,47 @@ async def append_langgraph_turn_to_chat_log(  # noqa: PLR0913
         debug_assist_trace=debug_assist_trace,
         final_spoken_text=final_spoken_text,
         ha_tool_intent_responses=ha_tool_intent_responses,
+        omit_final_spoken_content=omit_final_spoken_content,
     )
 
     async for _ in chat_log.async_add_delta_content_stream(agent_id, stream):  # type: ignore[arg-type]
         pass
+
+
+async def append_langgraph_turn_to_chat_log_from_delta_generator(
+    chat_log: ChatLog,
+    agent_id: str,
+    delta_stream: AsyncGenerator[dict[str, Any]],
+    *,
+    debug_delta_log: bool = False,
+) -> None:
+    """Drive ``ChatLog`` from a pre-built async generator of delta dicts."""
+    logged = _async_iter_with_optional_delta_logging(
+        delta_stream, enabled=debug_delta_log
+    )
+    async for _ in chat_log.async_add_delta_content_stream(agent_id, logged):  # type: ignore[arg-type]
+        pass
+
+
+async def iter_replay_deltas_after_live_stream(  # noqa: PLR0913
+    graph_messages: Sequence[AnyMessage],
+    *,
+    input_message_count: int,
+    reasoning_plain: str,
+    has_native_thinking: bool,
+    debug_assist_trace: bool,
+    final_spoken_text: str,
+    ha_tool_intent_responses: Mapping[str, intent.IntentResponse] | None,
+) -> AsyncGenerator[dict[str, Any]]:
+    """Tool rows, tool results, thinking; omit final ``content`` (streamed live)."""
+    turn = turn_messages_for_chat_log(graph_messages, input_message_count)
+    async for d in _delta_stream(
+        turn,
+        reasoning_plain=reasoning_plain,
+        has_native_thinking=has_native_thinking,
+        debug_assist_trace=debug_assist_trace,
+        final_spoken_text=final_spoken_text,
+        ha_tool_intent_responses=ha_tool_intent_responses,
+        omit_final_spoken_content=True,
+    ):
+        yield d
