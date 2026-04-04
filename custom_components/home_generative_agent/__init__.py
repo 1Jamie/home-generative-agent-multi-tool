@@ -1907,6 +1907,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
 
     if pool is None:
         entry.runtime_data.entity_index_ready = True
+        entry.runtime_data.tool_index_ready = True
     else:
 
         async def _run_entity_index() -> None:

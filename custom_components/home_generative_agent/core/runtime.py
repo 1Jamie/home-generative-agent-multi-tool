@@ -70,7 +70,10 @@ class HGAData:
     proposal_store: ProposalStore | None
     rule_registry: RuleRegistry | None
     baseline_updater: SentinelBaselineUpdater | None = None
-    tools_version_hash: str | None = None
+    tool_content_hashes: dict[str, str] = field(default_factory=dict)
+    instruction_content_hashes: dict[str, str] = field(default_factory=dict)
+    tool_index_ready: bool = False
+    tool_index_task: Any = None
     graph_invocation_gate: GraphInvocationGate = field(
         default_factory=GraphInvocationGate
     )

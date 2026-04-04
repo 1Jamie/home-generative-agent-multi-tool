@@ -637,7 +637,7 @@ def _actuation_binding_tool_names_from_available(
     return out
 
 
-async def _retrieve_tools(
+async def _retrieve_tools(  # noqa: PLR0912, PLR0915
     state: State, config: RunnableConfig, *, store: BaseStore
 ) -> dict[str, Any]:
     """Retrieve relevant tools based on user's message."""
@@ -678,28 +678,41 @@ async def _retrieve_tools(
         CONF_INSTRUCTION_RAG_INTENT_WEIGHT, RECOMMENDED_INSTRUCTION_RAG_INTENT_WEIGHT
     )
 
-    tool_task = store.asearch(("system", "tools"), query=query_prompt, limit=limit)
-    instruction_intent_task = store.asearch(
-        ("system", "instructions"), query=query_prompt, limit=instruction_limit
-    )
-    instruction_body_task = store.asearch(
-        ("system", "instructions_body"), query=query_prompt, limit=instruction_limit
-    )
-
-    raw_tool, raw_intent, raw_body = await asyncio.gather(
-        tool_task,
-        instruction_intent_task,
-        instruction_body_task,
-        return_exceptions=True,
+    runtime_data = config["configurable"].get("runtime_data")
+    tool_index_ready = (
+        getattr(runtime_data, "tool_index_ready", True)
+        if runtime_data is not None
+        else True
     )
 
-    tool_items = _vector_search_result_or_empty(raw_tool, label="Tool")
-    instruction_intent_items = _vector_search_result_or_empty(
-        raw_intent, label="Instruction intent"
-    )
-    instruction_body_items = _vector_search_result_or_empty(
-        raw_body, label="Instruction body"
-    )
+    if not tool_index_ready:
+        LOGGER.debug("Tool index warming up — skipping vector retrieval this turn")
+        tool_items = []
+        instruction_intent_items = []
+        instruction_body_items = []
+    else:
+        tool_task = store.asearch(("system", "tools"), query=query_prompt, limit=limit)
+        instruction_intent_task = store.asearch(
+            ("system", "instructions"), query=query_prompt, limit=instruction_limit
+        )
+        instruction_body_task = store.asearch(
+            ("system", "instructions_body"), query=query_prompt, limit=instruction_limit
+        )
+
+        raw_tool, raw_intent, raw_body = await asyncio.gather(
+            tool_task,
+            instruction_intent_task,
+            instruction_body_task,
+            return_exceptions=True,
+        )
+
+        tool_items = _vector_search_result_or_empty(raw_tool, label="Tool")
+        instruction_intent_items = _vector_search_result_or_empty(
+            raw_intent, label="Instruction intent"
+        )
+        instruction_body_items = _vector_search_result_or_empty(
+            raw_body, label="Instruction body"
+        )
 
     retrieved_names = set()
     for item in tool_items:
@@ -713,7 +726,9 @@ async def _retrieve_tools(
                 threshold,
             )
             continue
-        retrieved_names.add(item.key)
+        key = str(item.key)
+        plain_name = key.split("::", 1)[-1] if "::" in key else key
+        retrieved_names.add(plain_name)
 
     # Drop vector hits for tools not in the session (disabled in Tool Manager or stale).
     retrieved_names = {k for k in retrieved_names if k in available_tool_names}

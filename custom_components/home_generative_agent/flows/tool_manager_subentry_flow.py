@@ -149,7 +149,9 @@ class ToolManagerSubentryFlow(ConfigSubentryFlow):
     def _trigger_reindex(self) -> None:
         """Tell the RAG engine to reindex tools because tags changed."""
         entry = self._get_entry()
-        entry.runtime_data.tools_version_hash = "FORCED_REINDEX"
+        entry.runtime_data.tool_content_hashes = {}
+        entry.runtime_data.instruction_content_hashes = {}
+        entry.runtime_data.tool_index_ready = False
 
     async def async_step_user(
         self, _user_input: dict[str, Any] | None = None

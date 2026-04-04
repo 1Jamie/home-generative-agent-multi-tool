@@ -1480,7 +1480,10 @@ async def get_available_tools(
     formatted_query = prompt_template.format(query=query)
 
     docs = await store.asearch(namespace, query=formatted_query, limit=10)
-    tool_names = [doc.key for doc in docs]
+    tool_names = []
+    for doc in docs:
+        key = str(doc.key)
+        tool_names.append(key.split("::", 1)[-1] if "::" in key else key)
 
     joined = ", ".join(tool_names)
     result_msg = (

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import string
 from typing import TYPE_CHECKING, Any, Literal
@@ -77,7 +76,7 @@ if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
     from langchain_core.runnables import RunnableConfig
 
-    from .core.runtime import HGAConfigEntry
+    from .core.runtime import HGAConfigEntry, HGAData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +125,47 @@ def _format_tool(
     if tool.description:
         tool_spec["description"] = tool.description
     return {"type": "function", "function": tool_spec}
+
+
+LANGCHAIN_INTERNAL_API_ID = "langchain_internal"
+
+
+def _tool_index_content_and_hash(
+    name: str,
+    description: str | None,
+    tools_cfg: dict[str, Any],
+) -> tuple[str, str]:
+    """Build truncated embedding text and a sha256 for per-tool delta detection."""
+    content = description or ""
+    if not name.startswith("unnamed_tool_"):
+        content = f"{name}: {content}"
+    t_cfg = tools_cfg.get(name, {})
+    custom_tags = t_cfg.get("tags", "")
+    if custom_tags:
+        content = f"{content}\nKeywords/Tags: {custom_tags}"
+    truncated = truncate_for_embedding_index(content)
+    digest = hashlib.sha256(truncated.encode()).hexdigest()
+    return truncated, digest
+
+
+async def _run_tool_index_background(
+    *,
+    index_tasks: list[Any],
+    tool_hashes: dict[str, str],
+    instruction_hashes: dict[str, str],
+    rd: HGAData,
+) -> None:
+    """Chunked aput under pool gate; update hashes only after successful embed."""
+    try:
+        async with rd.graph_invocation_gate.hold():
+            if index_tasks:
+                await gather_store_puts_in_chunks(index_tasks)
+        rd.tool_content_hashes.update(tool_hashes)
+        rd.instruction_content_hashes.update(instruction_hashes)
+    except Exception:
+        _LOGGER.exception("Tool index background task failed")
+    finally:
+        rd.tool_index_ready = True
 
 
 def _convert_content(
@@ -333,357 +373,372 @@ class HGAConversationEntity(conversation.ConversationEntity, AbstractConversatio
         else:
             langchain_tools = {}
 
-        # Version hash and PgVector indexing for RAG tool retrieval
-        tools_dict_list = []
-        for t in tools:
-            if isinstance(t, dict):
-                tools_dict_list.append(t)
-            else:
-                tools_dict_list.append({"name": t.name, "description": t.description})
+        # Incremental PgVector indexing for RAG tool retrieval (per-tool deltas).
+        store = runtime_data.store
+        index_tasks: list[Any] = []
+        new_tool_hashes: dict[str, str] = {}
+        new_instruction_hashes: dict[str, str] = {}
 
-        tools_json = json.dumps(tools_dict_list, sort_keys=True, default=str)
-        instructions_json = json.dumps(instructions_cfg, sort_keys=True, default=str)
-        # Force re-index by prefixing with version (content field fix)
-        # Include instructions in the hash so they trigger re-index too.
-        # Entity metadata is indexed in a background task (see __init__.py), not here.
-        tools_hash = hashlib.sha256(
-            f"v6:{tools_json}:{instructions_json}".encode()
-        ).hexdigest()
-        async with runtime_data.graph_invocation_gate.hold():
-            if runtime_data.tools_version_hash != tools_hash:
-                _LOGGER.debug(
-                    "Tool definitions changed (or first run). "
-                    "Indexing into vector store."
+        unnamed_i = 0
+        for api in llm_apis:
+            for tool in api.tools:
+                if tool.name == HA_TOOL_GET_LIVE_CONTEXT:
+                    continue
+                t_cfg = tools_cfg.get(tool.name, {})
+                if not t_cfg.get("enabled", True):
+                    continue
+                td = _format_tool(tool, custom_serializer)
+                name = (
+                    td.get("name") or td.get("function", {}).get("name") or td.get("id")
                 )
-                store = runtime_data.store
-                index_tasks: list[Any] = []
-                for i, td in enumerate(tools_dict_list):
-                    name = (
-                        td.get("name")
-                        or td.get("function", {}).get("name")
-                        or td.get("id")
+                description = td.get("description") or td.get("function", {}).get(
+                    "description"
+                )
+                if not name:
+                    name = f"unnamed_tool_{unnamed_i}"
+                    unnamed_i += 1
+                    _LOGGER.warning(
+                        (
+                            "Tool is missing a name (using fallback '%s'). "
+                            "Full tool dict: %s"
+                        ),
+                        name,
+                        td,
                     )
-                    description = td.get("description") or td.get("function", {}).get(
-                        "description"
-                    )
-
-                    if not name:
-                        name = f"unnamed_tool_{i}"
-                        _LOGGER.warning(
-                            (
-                                "Tool at index %d is missing a name "
-                                "(using fallback '%s'). Full tool dict: %s"
-                            ),
-                            i,
-                            name,
-                            td,
-                        )
-
-                    # Build the value to be indexed. We MUST use the "content" field
-                    # because the store is configured to only embed that field in
-                    # __init__.py.
-                    content = description or ""
-                    if not name.startswith("unnamed_tool_"):
-                        # For real tools, include the name in searchable content too.
-                        content = f"{name}: {content}"
-
-                    t_cfg = tools_cfg.get(name, {})
-                    custom_tags = t_cfg.get("tags", "")
-                    if custom_tags:
-                        content = f"{content}\nKeywords/Tags: {custom_tags}"
-
-                    content = truncate_for_embedding_index(content)
-
+                truncated, content_hash = _tool_index_content_and_hash(
+                    name, description, tools_cfg
+                )
+                api_id = getattr(api, "id", llm.LLM_API_ASSIST)
+                composite_key = f"{api_id}::{name}"
+                if runtime_data.tool_content_hashes.get(composite_key) != content_hash:
                     index_value = {
-                        "content": content,
+                        "content": truncated,
                         "name": name,
                         "description": description or "",
                     }
-
-                    index_tasks.append(
-                        store.aput(("system", "tools"), key=name, value=index_value)
-                    )
-
-                # Index active instructions
-                for i_name, i_cfg in instructions_cfg.items():
-                    if not i_cfg.get("enabled", True):
-                        continue
-
-                    i_prompt = i_cfg.get("prompt", "")
-                    i_tags = i_cfg.get("tags", "")
-
-                    i_content = f"Instruction: {i_name}"
-                    if i_tags:
-                        i_content = f"{i_content} (Tags: {i_tags})"
-
-                    i_content = truncate_for_embedding_index(i_content)
-
                     index_tasks.append(
                         store.aput(
-                            ("system", "instructions"),
-                            key=i_name,
-                            value={
-                                "content": i_content,
-                                "name": i_name,
-                                "prompt": i_prompt,
-                            },
+                            ("system", "tools"),
+                            key=composite_key,
+                            value=index_value,
                         )
                     )
+                    new_tool_hashes[composite_key] = content_hash
 
-                    stripped = strip_for_embedding(i_prompt)
-                    body_content = (
-                        f"Instruction: {i_name}\n{stripped}"
-                        if stripped
-                        else f"Instruction: {i_name}"
-                    )
-                    body_content = truncate_for_embedding_index(body_content)
+        if providers_cfg.get("langchain_internal", {}).get("enabled", True):
+            for tv in langchain_tools.values():
+                t_cfg = tools_cfg.get(tv.name, {})
+                if not t_cfg.get("enabled", True):
+                    continue
+                name = tv.name
+                description = tv.description
+                truncated, content_hash = _tool_index_content_and_hash(
+                    name, description, tools_cfg
+                )
+                composite_key = f"{LANGCHAIN_INTERNAL_API_ID}::{name}"
+                if runtime_data.tool_content_hashes.get(composite_key) != content_hash:
+                    index_value = {
+                        "content": truncated,
+                        "name": name,
+                        "description": description or "",
+                    }
                     index_tasks.append(
                         store.aput(
-                            ("system", "instructions_body"),
-                            key=i_name,
-                            value={
-                                "content": body_content,
-                                "name": i_name,
-                                "prompt": i_prompt,
-                            },
+                            ("system", "tools"),
+                            key=composite_key,
+                            value=index_value,
                         )
                     )
+                    new_tool_hashes[composite_key] = content_hash
 
-                # Chunked awaits — one big gather() overloads Ollama embed batches.
-                if index_tasks:
-                    await gather_store_puts_in_chunks(index_tasks)
+        for i_name, i_cfg in instructions_cfg.items():
+            if not i_cfg.get("enabled", True):
+                continue
+            i_prompt = i_cfg.get("prompt", "")
+            i_tags = i_cfg.get("tags", "")
 
-                runtime_data.tools_version_hash = tools_hash
+            i_content = f"Instruction: {i_name}"
+            if i_tags:
+                i_content = f"{i_content} (Tags: {i_tags})"
+            i_content = truncate_for_embedding_index(i_content)
 
-            # Conversation ID
-            _LOGGER.debug("Conversation ID: %s", conversation_id)
+            stripped = strip_for_embedding(i_prompt)
+            body_content = (
+                f"Instruction: {i_name}\n{stripped}"
+                if stripped
+                else f"Instruction: {i_name}"
+            )
+            body_content = truncate_for_embedding_index(body_content)
+            combined_hash = hashlib.sha256(
+                f"{i_content}\n---\n{body_content}".encode()
+            ).hexdigest()
+            if runtime_data.instruction_content_hashes.get(i_name) != combined_hash:
+                index_tasks.append(
+                    store.aput(
+                        ("system", "instructions"),
+                        key=i_name,
+                        value={
+                            "content": i_content,
+                            "name": i_name,
+                            "prompt": i_prompt,
+                        },
+                    )
+                )
+                index_tasks.append(
+                    store.aput(
+                        ("system", "instructions_body"),
+                        key=i_name,
+                        value={
+                            "content": body_content,
+                            "name": i_name,
+                            "prompt": i_prompt,
+                        },
+                    )
+                )
+                new_instruction_hashes[i_name] = combined_hash
 
-            # Resolve user name (None means automation)
+        if index_tasks:
             if (
-                user_input.context
-                and user_input.context.user_id
-                and (user := await hass.auth.async_get_user(user_input.context.user_id))
+                runtime_data.tool_index_task is None
+                or runtime_data.tool_index_task.done()
             ):
-                user_name = user.name
+                runtime_data.tool_index_ready = False
+                runtime_data.tool_index_task = hass.async_create_task(
+                    _run_tool_index_background(
+                        index_tasks=index_tasks,
+                        tool_hashes=new_tool_hashes,
+                        instruction_hashes=new_instruction_hashes,
+                        rd=runtime_data,
+                    )
+                )
+        elif not runtime_data.tool_index_ready:
+            runtime_data.tool_index_ready = True
 
-            # System prompt: HA api_prompt first, then user Tier 1 (override priority).
-            api_prompt = "\n".join(api.api_prompt for api in llm_apis if api.api_prompt)
-            try:
-                pin_enabled = options.get(CONF_CRITICAL_ACTION_PIN_ENABLED, True)
-                critical_prompt = CRITICAL_ACTION_PROMPT if pin_enabled else ""
-                schema_prompt = (
-                    SCHEMA_FIRST_YAML_PROMPT
-                    if options.get(CONF_SCHEMA_FIRST_YAML, False)
+        # Conversation ID
+        _LOGGER.debug("Conversation ID: %s", conversation_id)
+
+        # Resolve user name (None means automation)
+        if (
+            user_input.context
+            and user_input.context.user_id
+            and (user := await hass.auth.async_get_user(user_input.context.user_id))
+        ):
+            user_name = user.name
+
+        # System prompt: HA api_prompt first, then user Tier 1 (override priority).
+        api_prompt = "\n".join(api.api_prompt for api in llm_apis if api.api_prompt)
+        try:
+            pin_enabled = options.get(CONF_CRITICAL_ACTION_PIN_ENABLED, True)
+            critical_prompt = CRITICAL_ACTION_PROMPT if pin_enabled else ""
+            schema_prompt = (
+                SCHEMA_FIRST_YAML_PROMPT
+                if options.get(CONF_SCHEMA_FIRST_YAML, False)
+                else ""
+            )
+            rendered_user = template.Template(
+                (
+                    llm.DATE_TIME_PROMPT
+                    + options.get(CONF_PROMPT, llm.DEFAULT_INSTRUCTIONS_PROMPT)
+                    + f"\nYou are in the {self.tz} timezone."
+                    + critical_prompt
+                    + schema_prompt
+                    + TOOL_CALL_ERROR_SYSTEM_MESSAGE
+                    if tools
                     else ""
-                )
-                rendered_user = template.Template(
-                    (
-                        llm.DATE_TIME_PROMPT
-                        + options.get(CONF_PROMPT, llm.DEFAULT_INSTRUCTIONS_PROMPT)
-                        + f"\nYou are in the {self.tz} timezone."
-                        + critical_prompt
-                        + schema_prompt
-                        + TOOL_CALL_ERROR_SYSTEM_MESSAGE
-                        if tools
-                        else ""
-                    ),
-                    self.hass,
-                ).async_render(
-                    {
-                        "ha_name": self.hass.config.location_name,
-                        "user_name": user_name,
-                        "llm_context": llm_context,
-                    },
-                    parse_result=False,
-                )
-            except TemplateError as err:
-                _LOGGER.exception("Error rendering prompt.")
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    f"Sorry, I had a problem with my template: {err}",
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-
-            prompt_parts: list[str] = []
-            if api_prompt:
-                prompt_parts.append(api_prompt)
-            prompt_parts.append(rendered_user)
-            prompt = "\n".join(prompt_parts)
-
-            # Use the already-configured chat model from __init__.py
-            base_llm = runtime_data.chat_model
-
-            # Tools are no longer bound here. We pass available_tools to the config
-            # and bind dynamically via RAG. We still verify the model supports tools;
-            # see __init__ checks, or bind an empty list to test if needed.
-            if not hasattr(base_llm, "bind_tools"):
-                _LOGGER.exception("Error during conversation processing.")
-                intent_response = intent.IntentResponse(language=user_input.language)
-                has_provider = any(
-                    subentry.subentry_type == SUBENTRY_TYPE_MODEL_PROVIDER
-                    for subentry in self.entry.subentries.values()
-                )
-                if not has_provider:
-                    msg = (
-                        "This integration isn't configured with a model provider. "
-                        "Go to Settings -> Devices & Services -> "
-                        "Home Generative Agent -> Add Model Provider."
-                    )
-                else:
-                    msg = (
-                        "This model doesn't support tool calling. "
-                        "Choose a compatible model or provider."
-                    )
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    msg,
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-
-            # A user name of None indicates an automation is being run.
-            user_name = "robot" if user_name is None else user_name
-            # Strip punctuation: memory namespace labels cannot contain them.
-            user_name = user_name.translate(str.maketrans("", "", string.punctuation))
-            _LOGGER.debug("User name: %s", user_name)
-
-            ha_tool_intent_responses: dict[str, intent.IntentResponse] = {}
-
-            app_config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": conversation_id,
-                    "user_id": user_name,
-                    "chat_model": base_llm,
-                    "available_tools": tools,
-                    "chat_model_options": runtime_data.chat_model_options,
-                    "prompt": prompt,
-                    "options": options,
-                    "vlm_model": runtime_data.vision_model,
-                    "summarization_model": runtime_data.summarization_model,
-                    "langchain_tools": langchain_tools,
-                    "ha_llm_api": MultiLLMAPI(llm_apis) if llm_apis else None,
-                    "hass": hass,
-                    "pending_actions": runtime_data.pending_actions,
-                    "runtime_data": runtime_data,
-                    "tool_mgr_data": tool_mgr_data,
-                    GRAPH_CFG_HA_TOOL_INTENT_RESPONSES: ha_tool_intent_responses,
+                ),
+                self.hass,
+            ).async_render(
+                {
+                    "ha_name": self.hass.config.location_name,
+                    "user_name": user_name,
+                    "llm_context": llm_context,
                 },
-                "recursion_limit": 10,
-            }
-
-            # Compile graph into a LangChain Runnable.
-            app = workflow.compile(
-                store=self.entry.runtime_data.store,
-                checkpointer=self.entry.runtime_data.checkpointer,
-                debug=LANGCHAIN_LOGGING_LEVEL == "debug",
+                parse_result=False,
+            )
+        except TemplateError as err:
+            _LOGGER.exception("Error rendering prompt.")
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                f"Sorry, I had a problem with my template: {err}",
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=conversation_id
             )
 
-            # Agent input: message history + current user request.
-            messages: list[AnyMessage] = []
-            messages.extend(message_history)
-            messages.append(HumanMessage(content=user_input.text))
-            app_input: State = {
-                "messages": messages,
-                "summary": "",
-                "chat_model_usage_metadata": {},
-                "messages_to_remove": [],
-                "selected_tools": [],
-                "selected_instructions": [],
-                "redacted_thinking_chunks": [],
-            }
-            input_message_count = len(messages)
+        prompt_parts: list[str] = []
+        if api_prompt:
+            prompt_parts.append(api_prompt)
+        prompt_parts.append(rendered_user)
+        prompt = "\n".join(prompt_parts)
 
-            # Interact with agent app (LangGraph astream_events → live ChatLog deltas).
-            response_snapshot: dict[str, Any] = {}
+        # Use the already-configured chat model from __init__.py
+        base_llm = runtime_data.chat_model
 
-            try:
-                await append_langgraph_turn_to_chat_log_from_delta_generator(
-                    chat_log,
-                    user_input.agent_id,
-                    iter_merged_chat_log_deltas(
-                        app,
-                        app_input,
-                        app_config,
-                        hass=hass,
-                        input_message_count=input_message_count,
-                        ha_tool_intent_responses=ha_tool_intent_responses,
-                        conf_schema_first_yaml=bool(
-                            options.get(CONF_SCHEMA_FIRST_YAML, False)
-                        ),
-                        conf_debug_assist_trace=bool(
-                            options.get(CONF_DEBUG_ASSIST_TRACE, False)
-                        ),
-                        response_holder=response_snapshot,
+        # Tools are no longer bound here. We pass available_tools to the config
+        # and bind dynamically via RAG. We still verify the model supports tools;
+        # see __init__ checks, or bind an empty list to test if needed.
+        if not hasattr(base_llm, "bind_tools"):
+            _LOGGER.exception("Error during conversation processing.")
+            intent_response = intent.IntentResponse(language=user_input.language)
+            has_provider = any(
+                subentry.subentry_type == SUBENTRY_TYPE_MODEL_PROVIDER
+                for subentry in self.entry.subentries.values()
+            )
+            if not has_provider:
+                msg = (
+                    "This integration isn't configured with a model provider. "
+                    "Go to Settings -> Devices & Services -> "
+                    "Home Generative Agent -> Add Model Provider."
+                )
+            else:
+                msg = (
+                    "This model doesn't support tool calling. "
+                    "Choose a compatible model or provider."
+                )
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                msg,
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=conversation_id
+            )
+
+        # A user name of None indicates an automation is being run.
+        user_name = "robot" if user_name is None else user_name
+        # Strip punctuation: memory namespace labels cannot contain them.
+        user_name = user_name.translate(str.maketrans("", "", string.punctuation))
+        _LOGGER.debug("User name: %s", user_name)
+
+        ha_tool_intent_responses: dict[str, intent.IntentResponse] = {}
+
+        app_config: RunnableConfig = {
+            "configurable": {
+                "thread_id": conversation_id,
+                "user_id": user_name,
+                "chat_model": base_llm,
+                "available_tools": tools,
+                "chat_model_options": runtime_data.chat_model_options,
+                "prompt": prompt,
+                "options": options,
+                "vlm_model": runtime_data.vision_model,
+                "summarization_model": runtime_data.summarization_model,
+                "langchain_tools": langchain_tools,
+                "ha_llm_api": MultiLLMAPI(llm_apis) if llm_apis else None,
+                "hass": hass,
+                "pending_actions": runtime_data.pending_actions,
+                "runtime_data": runtime_data,
+                "tool_mgr_data": tool_mgr_data,
+                GRAPH_CFG_HA_TOOL_INTENT_RESPONSES: ha_tool_intent_responses,
+            },
+            "recursion_limit": 10,
+        }
+
+        # Compile graph into a LangChain Runnable.
+        app = workflow.compile(
+            store=self.entry.runtime_data.store,
+            checkpointer=self.entry.runtime_data.checkpointer,
+            debug=LANGCHAIN_LOGGING_LEVEL == "debug",
+        )
+
+        # Agent input: message history + current user request.
+        messages: list[AnyMessage] = []
+        messages.extend(message_history)
+        messages.append(HumanMessage(content=user_input.text))
+        app_input: State = {
+            "messages": messages,
+            "summary": "",
+            "chat_model_usage_metadata": {},
+            "messages_to_remove": [],
+            "selected_tools": [],
+            "selected_instructions": [],
+            "redacted_thinking_chunks": [],
+        }
+        input_message_count = len(messages)
+
+        # Interact with agent app (LangGraph astream_events → live ChatLog deltas).
+        response_snapshot: dict[str, Any] = {}
+
+        try:
+            await append_langgraph_turn_to_chat_log_from_delta_generator(
+                chat_log,
+                user_input.agent_id,
+                iter_merged_chat_log_deltas(
+                    app,
+                    app_input,
+                    app_config,
+                    hass=hass,
+                    input_message_count=input_message_count,
+                    ha_tool_intent_responses=ha_tool_intent_responses,
+                    conf_schema_first_yaml=bool(
+                        options.get(CONF_SCHEMA_FIRST_YAML, False)
                     ),
-                    debug_delta_log=bool(options.get(CONF_DEBUG_ASSIST_TRACE, False)),
-                )
-                ensure_chat_log_ends_with_assistant(
-                    chat_log, agent_id=user_input.agent_id
-                )
-            except PoolClosed:
-                _LOGGER.warning(
-                    "Database pool closed during graph run (integration reloading?)"
-                )
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    "The assistant was interrupted; please try again.",
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-            except HomeAssistantError as err:
-                _LOGGER.exception("LangGraph error during conversation processing.")
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    f"Something went wrong: {err}",
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-
-            response = response_snapshot.get("values")
-            if response is None:
-                intent_response = intent.IntentResponse(language=user_input.language)
-                intent_response.async_set_error(
-                    intent.IntentResponseErrorCode.UNKNOWN,
-                    "The assistant did not return a response.",
-                )
-                return conversation.ConversationResult(
-                    response=intent_response, conversation_id=conversation_id
-                )
-
-            trace.async_conversation_trace_append(
-                trace.ConversationTraceEventType.AGENT_DETAIL,
-                {"messages": response["messages"], "tools": tools or None},
+                    conf_debug_assist_trace=bool(
+                        options.get(CONF_DEBUG_ASSIST_TRACE, False)
+                    ),
+                    response_holder=response_snapshot,
+                ),
+                debug_delta_log=bool(options.get(CONF_DEBUG_ASSIST_TRACE, False)),
+            )
+            ensure_chat_log_ends_with_assistant(chat_log, agent_id=user_input.agent_id)
+        except PoolClosed:
+            _LOGGER.warning(
+                "Database pool closed during graph run (integration reloading?)"
+            )
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                "The assistant was interrupted; please try again.",
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=conversation_id
+            )
+        except HomeAssistantError as err:
+            _LOGGER.exception("LangGraph error during conversation processing.")
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                f"Something went wrong: {err}",
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=conversation_id
             )
 
-            _LOGGER.debug("====== End of run ======")
+        response = response_snapshot.get("values")
+        if response is None:
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                "The assistant did not return a response.",
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=conversation_id
+            )
 
-            final_content = response["messages"][-1].content
-            if isinstance(final_content, str):
-                if options.get(CONF_SCHEMA_FIRST_YAML, False):
-                    final_content = _maybe_fix_dashboard_entities(final_content, hass)
-                else:
-                    final_content = _fix_entity_ids_in_text(final_content, hass)
-                final_content = _convert_schema_json_to_yaml(
-                    final_content, options.get(CONF_SCHEMA_FIRST_YAML, False)
-                )
-                _LOGGER.debug("Final response content: %s", final_content)
-            # ``continue_conversation``: last assistant ends with ? etc. (ChatLog).
-            conv_result = conversation.async_get_result_from_chat_log(
-                user_input, chat_log
+        trace.async_conversation_trace_append(
+            trace.ConversationTraceEventType.AGENT_DETAIL,
+            {"messages": response["messages"], "tools": tools or None},
+        )
+
+        _LOGGER.debug("====== End of run ======")
+
+        final_content = response["messages"][-1].content
+        if isinstance(final_content, str):
+            if options.get(CONF_SCHEMA_FIRST_YAML, False):
+                final_content = _maybe_fix_dashboard_entities(final_content, hass)
+            else:
+                final_content = _fix_entity_ids_in_text(final_content, hass)
+            final_content = _convert_schema_json_to_yaml(
+                final_content, options.get(CONF_SCHEMA_FIRST_YAML, False)
             )
-            _apply_query_answer_when_no_ha_intent(
-                conv_result,
-                ha_had_intent_response_from_tool=bool(ha_tool_intent_responses),
-            )
-            return conv_result
+            _LOGGER.debug("Final response content: %s", final_content)
+        # ``continue_conversation``: last assistant ends with ? etc. (ChatLog).
+        conv_result = conversation.async_get_result_from_chat_log(user_input, chat_log)
+        _apply_query_answer_when_no_ha_intent(
+            conv_result,
+            ha_had_intent_response_from_tool=bool(ha_tool_intent_responses),
+        )
+        return conv_result
 
     async def _async_entry_update_listener(
         self, hass: HomeAssistant, entry: ConfigEntry
